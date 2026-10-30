@@ -33,6 +33,10 @@ done
 for l in c android aaudio log; do
   clang --target=aarch64-linux-android28 -w -fPIC -shared -nostdlib -Wl,-soname,lib$l.so -o build/stubs/lib$l.so build/stubs/lib$l.c
 done
+# every import must exist on the oldest supported Android (the stubs accept anything)
+BIONIC="${BIONIC_MAPS:-/root/sysrc}"
+python3 android/check_imports.py 28 build/stubs "$BIONIC/bionic/libc/libc.map.txt" \
+  "$BIONIC/fb/native/android/libandroid.map.txt" "$SYSROOT/usr/include/aaudio/AAudio.h"
 ld.lld -shared -soname libgreenscreen.so --no-undefined -z now -z relro -z noexecstack -z max-page-size=16384 \
   --hash-style=both --build-id=sha1 --gc-sections -o build/apk/lib/arm64-v8a/libgreenscreen.so \
   build/arm64/*.o -Lbuild/stubs -lc -landroid -laaudio -llog

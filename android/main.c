@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
-#include <math.h>
 #include "gbcore.h"
 #include "touchui.h"
 #include "link.h"
@@ -138,7 +137,11 @@ static int vol_level = VOL_MAX, vol_muted;
 #define SENS_MAX 10
 static int sens_touch = 5, sens_flick = 5;
 static int show_online = 1;    /* listed as online for 2-player invitations */
-static float sens_factor(int v) { return powf(2.f, (5 - v) / 4.f); }   /* <1 = more sensitive */
+/* 2^((5 - v) / 4): <1 = more sensitive. A table, so the app needs nothing from libm */
+static float sens_factor(int v) {
+    static const float f[11] = { 2.3784f, 2.0000f, 1.6818f, 1.4142f, 1.1892f, 1.0000f, 0.8409f, 0.7071f, 0.5946f, 0.5000f, 0.4204f };
+    return f[v < 0 ? 0 : v > 10 ? 10 : v];
+}
 /* speed / load readout for the CONTROLS panel */
 static int64_t perf_t0, perf_work_ns; static int perf_frames, perf_loops; static float perf_speed = 100.f, perf_ms;
 static int64_t vol_shown_until;    /* show the level on screen for a moment after a change */
