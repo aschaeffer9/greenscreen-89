@@ -1,0 +1,18 @@
+# build output (contains nothing from the game, but it's generated)
+build/
+core/cpu_interp.c
+__pycache__/
+# never commit game data or signing keys
+*.gb
+*.gbc
+*.zip
+rom/
+*.keystore
+*.jks
+*.pem
+# test output
+test/mqtt/mqtest
+test/mqtt/fbtest
+*.log
+*.ppm
+*.raw

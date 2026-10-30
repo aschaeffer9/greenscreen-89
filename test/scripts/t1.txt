@@ -1,0 +1,4 @@
+0 0
+dump 60
+dump 200
+dump 400
