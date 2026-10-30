@@ -33,11 +33,25 @@ async def deliver(w, pkt):
         pass
 
 
+def publish(topic, payload):
+    body = len(topic.encode()).to_bytes(2, 'big') + topic.encode() + payload
+    pkt = bytes([0x30]) + enc_len(len(body)) + body
+    for o in list(subs.get(topic, ())):
+        asyncio.ensure_future(deliver(o, pkt))
+
+
 async def client(r, w):
     mine = []
+    will = [None]
     try:
         h, body = await read_pkt(r)
         if h != 0x10 or body[2:6] != b'MQTT': return
+        flags = body[7]; i = 10
+        n = body[i] << 8 | body[i + 1]; i += 2 + n           # client id
+        if flags & 0x04:                                       # last will
+            n = body[i] << 8 | body[i + 1]; will_topic = body[i + 2:i + 2 + n].decode(); i += 2 + n
+            n = body[i] << 8 | body[i + 1]; will_msg = body[i + 2:i + 2 + n]; i += 2 + n
+            will[0] = (will_topic, will_msg)
         w.write(bytes([0x20, 2, 0, 0])); await w.drain()
         while True:
             h, body = await read_pkt(r)
@@ -57,11 +71,13 @@ async def client(r, w):
             elif t == 0xC0:
                 w.write(bytes([0xD0, 0])); await w.drain()
             elif t == 0xE0:
+                will[0] = None                  # clean goodbye: no will
                 return
     except (asyncio.IncompleteReadError, ConnectionError):
         pass
     finally:
         for t in mine: subs.get(t, set()).discard(w)
+        if will[0]: publish(*will[0])
         w.close()
 
 

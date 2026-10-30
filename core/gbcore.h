@@ -49,6 +49,7 @@ int tetris_piece_landed(void);
 int tetris_link_fire_and_forget(uint16_t pc);
 int tetris_is_2player(void);
 int tetris_link_hold_while_waiting(void);
+int tetris_single_busy(void);       /* mid single-player game (online status) */
 /* debugging */
 extern int force_interp;
 extern unsigned long long gb_interp_count;

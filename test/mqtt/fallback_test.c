@@ -8,13 +8,18 @@
 #include <unistd.h>
 #include "../../android/net.h"
 static int64_t now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec; }
-static void pump(int64_t ns) { int64_t t = now(); while (now() - t < ns) { uint8_t b[64]; net_poll(now()); while (net_recv(b, sizeof b) > 0) {} net_wait(5000000); } }
+/* keep test packets that arrive while we wait (the other side may start the next phase first) */
+static uint8_t early[600][8]; static int nearly, eat;
+static void pump(int64_t ns) { int64_t t = now(); while (now() - t < ns) { uint8_t b[64]; int n; net_poll(now());
+    while ((n = net_recv(b, sizeof b)) > 0) if (b[0] == 7 && nearly < 600) memcpy(early[nearly++], b, 8);
+    net_wait(5000000); } }
+static int next_pkt(uint8_t *b) { if (eat < nearly) { memcpy(b, early[eat++], 8); return 8; } return net_recv(b, 64); }
 static int exchange(const char *role, int base) {
     int sent = 0, got = 0, bad = 0; int64_t t0 = now();
     while ((sent < 300 || got < 300) && now() - t0 < 20000000000LL) {
         if (sent < 300) { uint8_t p[6] = { 7, (uint8_t)(base + sent), (uint8_t)((base + sent) >> 8), (uint8_t)role[0] }; net_send(p, 6); sent++; }
         uint8_t b[64]; int n;
-        while ((n = net_recv(b, sizeof b)) > 0) { if (b[0] != 7) continue; int k = b[1] | b[2] << 8; if (k != base + got || b[3] == (uint8_t)role[0]) bad++; got++; }
+        while ((n = next_pkt(b)) > 0) { if (b[0] != 7) continue; int k = b[1] | b[2] << 8; if (k != base + got || b[3] == (uint8_t)role[0]) bad++; got++; }
         net_poll(now()); net_wait(2000000);
     }
     printf("[%s] phase %d: sent %d got %d bad %d, path %s\n", role, base, sent, got, bad, net_online_direct() ? "DIRECT" : "RELAY");

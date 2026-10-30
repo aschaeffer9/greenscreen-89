@@ -107,7 +107,7 @@ static int hard_drop_hold;      /* frames to keep DOWN held after a hard drop */
 static int64_t hint_until;      /* controls hint shown for a while after launch */
 static Macro macro;             /* scripted presses from menu taps */
 /* 2-player link */
-enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM, LUI_CTL };
+enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM, LUI_CTL, LUI_INVITE };
 static int lui;                 /* link overlay state */
 static char lui_msg[64];
 static int64_t linked_toast_until;
@@ -137,6 +137,7 @@ static int vol_level = VOL_MAX, vol_muted;
 /* control feel, set in the CONTROLS panel: 1..10 (5 = default), flick 0 = hard drop off */
 #define SENS_MAX 10
 static int sens_touch = 5, sens_flick = 5;
+static int show_online = 1;    /* listed as online for 2-player invitations */
 static float sens_factor(int v) { return powf(2.f, (5 - v) / 4.f); }   /* <1 = more sensitive */
 /* speed / load readout for the CONTROLS panel */
 static int64_t perf_t0, perf_work_ns; static int perf_frames, perf_loops; static float perf_speed = 100.f, perf_ms;
@@ -169,6 +170,8 @@ static uint8_t held_from_pointers(void) {
 
 static void overlay_tap(float x, float y);
 static void open_controls(void);
+static int64_t insert_anim_t0;
+static void finish_insert_anim(void);
 static void unlink_session(const char *why);
 #define RESET_HOLD_NS 1200000000LL
 static void do_soft_reset(void);
@@ -297,6 +300,7 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
         vol_shown_until = now_ns() + 1500000000LL;
         save_settings();
     }
+    if (!cancel && p->kind == 0 && insert_anim_t0) { finish_insert_anim(); p->active = 0; return; }   /* tap skips the animation */
     if (!cancel && p->kind == 0 && lui != LUI_NONE) {
         float dx = x - p->x0, dy = y - p->y0, slop = dpi * 0.15f;
         if (dx * dx + dy * dy < slop * slop) overlay_tap(p->x0, p->y0);
@@ -385,6 +389,7 @@ static int handle_key(AInputEvent *ev) {
         if (action == AKEY_EVENT_ACTION_UP && lui != LUI_NONE) {
             if (lui == LUI_SEARCH) net_stop();
             if (lui == LUI_CTL) save_settings();
+            if (lui == LUI_INVITE) net_invite_answer(0);
             lui = lui == LUI_CPU ? LUI_MENU : LUI_NONE;
             return 1;
         }
@@ -492,10 +497,12 @@ static const uint32_t shade[4] = { RGB(0xC4, 0xCF, 0xA1), RGB(0x8B, 0x95, 0x6D),
 #define C_PADHI  RGB(0x26, 0x29, 0x2E)
 #define C_DIM    RGB(0x5C, 0x60, 0x68)
 #define C_TEXT   RGB(0xB8, 0xBC, 0xC4)
+#define C_GREEN  RGB(0x5C, 0xD0, 0x6A)
 #define C_BTN    RGB(0x2F, 0x32, 0x38)
 #define C_BTNON  RGB(0x4A, 0x4F, 0x58)
 
 typedef struct { uint32_t *px; int stride, w, h; } Canvas;
+static void draw_insert_anim(Canvas *c, int64_t t);
 
 static void fill(Canvas *c, int x, int y, int w, int h, uint32_t col) {
     if (x < 0) { w += x; x = 0; }
@@ -544,6 +551,8 @@ static const struct { char ch; uint8_t rows[7]; } font[] = {
     {'6', {6, 8, 16, 30, 17, 17, 14}}, {'7', {31, 1, 2, 4, 8, 8, 8}}, {'8', {14, 17, 17, 14, 17, 17, 14}},
     {'9', {14, 17, 17, 15, 1, 2, 12}}, {'=', {0, 0, 31, 0, 31, 0, 0}}, {'!', {4, 4, 4, 4, 4, 0, 4}},
     {'?', {14, 17, 1, 2, 4, 0, 4}}, {',', {0, 0, 0, 0, 12, 4, 8}}, {'\'', {4, 4, 8, 0, 0, 0, 0}},
+    {'|', {4, 4, 4, 4, 4, 4, 4}}, {'[', {14, 8, 8, 8, 8, 8, 14}}, {']', {14, 2, 2, 2, 2, 2, 14}},
+    {'_', {0, 0, 0, 0, 0, 0, 31}}, {'*', {0, 21, 14, 31, 14, 21, 0}}, {'#', {10, 31, 10, 10, 31, 10, 0}},
 };
 
 static const uint8_t *glyph(char ch) {
@@ -764,8 +773,9 @@ static void render(void) {
         }
         if (full_redraws_left > 0) full_redraws_left--;
     }
-    draw_screen(&c);
-    {
+    if (insert_anim_t0) { draw_insert_anim(&c, t); full_redraws_left = 2; }
+    else draw_screen(&c);
+    if (!insert_anim_t0) {
         float dp = dpi / 160.f;
         int tsc = (int)(dp * 1.6f + 0.5f); if (tsc < 2) tsc = 2;
         if (lui != LUI_NONE) draw_overlay(&c, tsc);
@@ -858,6 +868,34 @@ static void audio_close(void) {
     astream = NULL; audio_ok = 0;
 }
 
+/* Keep the sound alive. Once per frame while the app is in front:
+ *  - a stream that is paused / stopped / still pausing gets started (requestStart
+ *    fails while a pause is in progress, so a quick switch away and back used to
+ *    leave it paused for good: silence);
+ *  - a disconnected stream (headphones, Bluetooth, another app took the device)
+ *    is closed and reopened;
+ *  - a stream that stops playing for a second while we keep feeding it is reopened. */
+static int64_t audio_last_progress_ns, audio_last_read;
+static void audio_service(int64_t t) {
+    if (!astream) {
+        static int64_t next_try;
+        if (t >= next_try) { audio_open(); next_try = t + 2000000000LL; audio_last_progress_ns = t; }
+        return;
+    }
+    aaudio_stream_state_t st = AAudioStream_getState(astream);
+    if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSING || st == AAUDIO_STREAM_STATE_CLOSED) {
+        LOGI("audio stream state %d, reopening", (int)st);
+        audio_close(); audio_open(); audio_last_progress_ns = t; return;
+    }
+    if (st != AAUDIO_STREAM_STATE_STARTED && st != AAUDIO_STREAM_STATE_STARTING) AAudioStream_requestStart(astream);
+    int64_t rd = AAudioStream_getFramesRead(astream);
+    if (rd != audio_last_read || !audio_last_progress_ns) { audio_last_read = rd; audio_last_progress_ns = t; }
+    else if (t - audio_last_progress_ns > 1000000000LL) {
+        LOGI("audio stream stuck, reopening");
+        audio_close(); audio_open(); audio_last_progress_ns = t; audio_last_read = 0;
+    }
+}
+
 /* push the samples of one frame; blocks while the device buffer is full,
  * which is what keeps the game running at the real Game Boy speed */
 static int64_t next_frame_ns;
@@ -873,12 +911,13 @@ static void audio_push_and_pace(void) {
     if (astream) {
         while ((n = gb_audio_read(tmp, 4096)) > 0) {
             apply_volume(tmp, n);
-            aaudio_result_t r = AAudioStream_write(astream, tmp, n, 200000000LL);
+            aaudio_result_t r = AAudioStream_write(astream, tmp, n, 100000000LL);
             if (r < 0) {
                 LOGI("audio write error %d, reopening", (int)r);
                 audio_close(); audio_open();
                 break;
             }
+            if (r < n) break;            /* not draining (paused): drop the rest, audio_service restarts it */
         }
         if (astream) { next_frame_ns = 0; return; }
     }
@@ -928,7 +967,7 @@ static void save_settings(void) {
     if (!app.state_path[0] || import_mode) return;
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
     FILE *f = fopen(p, "w");
-    if (f) { fprintf(f, "vol %d\nmute %d\ntouch %d\nflick %d\n", vol_level, vol_muted, sens_touch, sens_flick); fclose(f); }
+    if (f) { fprintf(f, "vol %d\nmute %d\ntouch %d\nflick %d\nonline %d\n", vol_level, vol_muted, sens_touch, sens_flick, show_online); fclose(f); }
 }
 static void load_settings(void) {
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
@@ -940,6 +979,7 @@ static void load_settings(void) {
         else if (!strcmp(key, "mute")) vol_muted = v ? 1 : 0;
         else if (!strcmp(key, "touch") && v >= 1 && v <= SENS_MAX) sens_touch = v;
         else if (!strcmp(key, "flick") && v >= 0 && v <= SENS_MAX) sens_flick = v;
+        else if (!strcmp(key, "online")) show_online = v ? 1 : 0;
     }
     fclose(f);
 }
@@ -1063,6 +1103,21 @@ static void unlink_session(const char *why) {
     if (why) { snprintf(lui_msg, sizeof lui_msg, "%s", why); lui = LUI_MSG; }
     full_redraws_left = 4;
 }
+/* online presence: listed while the app is open (and the player allows it);
+ * busy while playing a solo game or linked; invitations pop up when free */
+static void presence_service(void) {
+    int want = show_online && rom_ready && !import_mode;
+    if (want) net_presence_start(app.act->vm, server_host);
+    else if (net_kind() != NET_KIND_ONLINE) net_presence_stop();
+    int busy = linked || vs_cpu || (net_kind() != NET_KIND_NONE && net_kind() != NET_KIND_ONLINE)
+               || tetris_single_busy() || lui == LUI_CTL || lui == LUI_CPU || insert_anim_t0 != 0;
+    net_presence_set_busy(busy);
+    int inv = net_invite_pending();
+    if (inv && busy && lui != LUI_INVITE) { net_invite_answer(0); inv = 0; }     /* never interrupt a game */
+    if (inv && !linked && (lui == LUI_NONE || lui == LUI_MENU || lui == LUI_MSG)) { lui = LUI_INVITE; full_redraws_left = 4; }
+    if (!inv && lui == LUI_INVITE) { snprintf(lui_msg, sizeof lui_msg, "THE INVITATION EXPIRED"); lui = LUI_MSG; full_redraws_left = 4; }
+    if (lui == LUI_INVITE || lui == LUI_MENU || lui == LUI_SEARCH) full_redraws_left = 2;   /* live counters */
+}
 /* connection housekeeping, once per frame */
 static void link_service(int64_t t) {
     if (!vs_cpu && net_kind() != NET_KIND_NONE) {
@@ -1167,6 +1222,70 @@ static int rom_perm_wait;              /* waiting for the storage permission to 
 static int64_t rom_perm_since, rom_next_poll, import_finish_at;
 static const char *ROM_DIRS[] = { "/storage/emulated/0/Download", "/storage/emulated/0/Documents", "/sdcard/Download" };
 
+
+/* ------------------------------------------------------------------ */
+/* the one-time "cartridge goes in" animation after a ROM is loaded    */
+/* ------------------------------------------------------------------ */
+/* insert_anim_t0: 0 = not playing (declared above) */
+#define INSERT_ANIM_NS 2700000000LL
+static void boot_game(void);
+static void start_insert_anim(void) {
+    insert_anim_t0 = now_ns();
+    lui = LUI_NONE;
+    full_redraws_left = 4;
+}
+static void finish_insert_anim(void) {
+    if (!insert_anim_t0) return;
+    insert_anim_t0 = 0;
+    boot_game();
+}
+static float ease_out(float x) { if (x < 0) x = 0; if (x > 1) x = 1; return 1.f - (1.f - x) * (1.f - x) * (1.f - x); }
+static void draw_insert_anim(Canvas *c, int64_t t) {
+    static const char *cart[] = {
+        "+-------------+",
+        "|  _________  |",
+        "| +---------+ |",
+        "| |         | |",
+        "| |  YOUR   | |",
+        "| |   GAME  | |",
+        "| |         | |",
+        "| +---------+ |",
+        "|  #  #  #  # |",
+        "+-------------+",
+        "  |||||||||||  ",
+    };
+    const int ncart = (int)(sizeof cart / sizeof cart[0]);
+    Rc r = L.screen;
+    fill(c, r.x, r.y, r.w, r.h, shade[0]);
+    float e = (float)(t - insert_anim_t0) / 1e9f;
+    int sc = r.w / (21 * 6); if (sc < 1) sc = 1;
+    int lh = 8 * sc;
+    int cx = r.x + r.w / 2;
+    /* the slot near the bottom of the screen */
+    int slot_y = r.y + r.h - r.h / 4;
+    int seat_top = slot_y - (ncart - 1) * lh + lh / 2;          /* contacts end up inside the slot */
+    int start_top = r.y - ncart * lh;
+    float k = ease_out(e / 1.1f);
+    int shake = (e > 1.1f && e < 1.25f) ? (int)(sc * ((int)(e * 60) % 2 ? 1 : -1)) : 0;
+    int top = start_top + (int)((float)(seat_top - start_top) * k) + shake;
+    for (int i = 0; i < ncart; i++) {
+        int y = top + i * lh;
+        if (y < r.y || y + 7 * sc > slot_y + lh / 2) continue;      /* clipped by the screen top and the slot */
+        text_c(c, cx, y, cart[i], sc, shade[3]);
+    }
+    text_c(c, cx, slot_y, "=[_______________]=", sc, shade[2]);
+    if (e > 1.1f && e < 1.6f) text_c(c, cx, slot_y + 2 * lh, "CLICK!", sc, shade[3]);
+    if (e > 1.35f) {
+        int on = e > 1.5f || ((int)(e * 20) % 2);
+        text(c, r.x + 2 * sc * 6, r.y + lh, on ? "POWER *" : "POWER", sc, shade[e > 1.5f ? 3 : 2]);
+    }
+    if (e > 1.6f) {
+        char msg[32]; int dots = (int)((e - 1.6f) / 0.15f); if (dots > 3) dots = 3;
+        snprintf(msg, sizeof msg, "READING ROM%.*s%s", dots, "...", e > 2.2f ? " OK" : "");
+        text_c(c, cx, slot_y + 2 * lh, msg, sc, shade[3]);
+    }
+}
+
 static void boot_game(void) {
     memset(pending, 0, sizeof pending);
     memset(&macro, 0, sizeof macro);
@@ -1190,7 +1309,7 @@ static void rom_accept(void) {
         snprintf(rom_msg, sizeof rom_msg, "ROM SAVED - STARTING");
         import_finish_at = now_ns() + 900000000LL;
         full_redraws_left = 4;
-    } else boot_game();
+    } else start_insert_anim();
 }
 static void rom_scan_now(void) {
     int r = rom_scan((const char *const *)ROM_DIRS, (int)(sizeof ROM_DIRS / sizeof ROM_DIRS[0]), tetris_rom);
@@ -1212,6 +1331,7 @@ static void rom_find_tap(void) {
 }
 /* once per frame while there's no ROM */
 static void rom_service(int64_t t) {
+    if (insert_anim_t0) { if (t - insert_anim_t0 > INSERT_ANIM_NS) finish_insert_anim(); return; }
     if (import_mode) {
         if (import_finish_at && t > import_finish_at) {
             import_finish_at = 0;
@@ -1230,7 +1350,7 @@ static void rom_service(int64_t t) {
     }
     if (t > rom_next_poll) {           /* imported by an "Open with" window meanwhile? */
         rom_next_poll = t + 500000000LL;
-        if (rom_check_file(app.rom_path, tetris_rom) == ROM_OK) boot_game();
+        if (rom_check_file(app.rom_path, tetris_rom) == ROM_OK) start_insert_anim();
     }
 }
 static void rom_tap(float x, float y) {
@@ -1310,6 +1430,7 @@ static void ctl_tap(float x, float y) {
     changed |= slider_tap(O.b4, x, y, &sens_flick, 0, SENS_MAX);
     Rc reset = O.b6, done = O.b6;
     reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
+    if (in_rc(O.b5, x, y)) { show_online = !show_online; changed = 1; }
     if (in_rc(reset, x, y)) { sens_touch = 5; sens_flick = 5; changed = 1; }
     else if (in_rc(done, x, y)) { save_settings(); lui = LUI_NONE; full_redraws_left = 4; return; }
     if (changed) { save_settings(); full_redraws_left = 4; }
@@ -1321,14 +1442,14 @@ static void draw_ctl_panel(Canvas *c, Rc in, int cx, int bts) {
     else snprintf(l2, sizeof l2, "HARD DROP FLICK  OFF");
     snprintf(l3, sizeof l3, "SPEED %d%%  LOAD %.1f MS", (int)(perf_speed + 0.5f), perf_ms);
     int ms = bts;
-    const char *w[] = { l1, l2, l3, "HIGHER = LESS MOVEMENT NEEDED" };
-    for (int i = 0; i < 4; i++) while (ms > 1 && text_w(w[i], ms) > in.w - 16) ms--;
+    const char *w[] = { l1, l2, l3 };
+    for (int i = 0; i < 3; i++) while (ms > 1 && text_w(w[i], ms) > in.w - 16) ms--;
     text_c(c, cx, O.b1.y + O.b1.h / 2 - 3 * ms, l1, ms, C_TEXT);
     draw_slider(c, O.b2, sens_touch, 1, SENS_MAX, bts);
     text_c(c, cx, O.b3.y + O.b3.h / 2 - 3 * ms, l2, ms, C_TEXT);
     draw_slider(c, O.b4, sens_flick, 0, SENS_MAX, bts);
-    text_c(c, cx, O.b5.y + 1 * ms, "HIGHER = LESS MOVEMENT NEEDED", ms, C_DIM);
-    text_c(c, cx, O.b5.y + 11 * ms, l3, ms, C_DIM);
+    draw_button(c, O.b5, show_online ? "SHOW ME ONLINE: YES" : "SHOW ME ONLINE: NO", show_online, bts);
+    text_c(c, cx, O.b6.y + O.b6.h + 2 * ms, l3, ms, C_DIM);
     Rc reset = O.b6, done = O.b6;
     reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
     draw_button(c, reset, "RESET", 0, bts);
@@ -1352,6 +1473,12 @@ static void overlay_tap(float x, float y) {
     overlay_layout();
     if (lui == LUI_ROM) { rom_tap(x, y); return; }
     if (lui == LUI_CTL) { ctl_tap(x, y); return; }
+    if (lui == LUI_INVITE) {
+        if (in_rc(O.b4, x, y)) { net_invite_answer(1); lui = LUI_SEARCH; }
+        else if (in_rc(O.b6, x, y)) { net_invite_answer(0); lui = LUI_NONE; }
+        full_redraws_left = 4;
+        return;
+    }
     if (lui == LUI_MENU) {
         if (in_rc(O.b1, x, y)) lui = LUI_CPU;
         else if (in_rc(O.b2, x, y)) { net_start_lan(); lui = LUI_SEARCH; }
@@ -1397,11 +1524,35 @@ static void draw_overlay(Canvas *c, int tsc) {
     int bts = ts > 4 ? 4 : ts;
     if (lui == LUI_ROM) { draw_rom_panel(c, in, cx, bts); return; }
     if (lui == LUI_CTL) { draw_ctl_panel(c, in, cx, bts); return; }
+    if (lui == LUI_INVITE) {
+        int ms = bts;
+        const char *l1 = "SOMEONE ONLINE WANTS", *l2 = "TO PLAY 2-PLAYER!";
+        while (ms > 1 && text_w(l1, ms) > in.w - 16) ms--;
+        text_c(c, cx, O.b1.y + O.b1.h / 2, l1, ms, C_TEXT);
+        text_c(c, cx, O.b1.y + O.b1.h / 2 + 10 * ms, l2, ms, C_TEXT);
+        char cd[32]; snprintf(cd, sizeof cd, "ANSWER IN %d", net_invite_pending());
+        text_c(c, cx, O.b3.y + O.b3.h / 4, cd, ms, C_DIM);
+        draw_button(c, O.b4, "ACCEPT", 1, bts);
+        draw_button(c, O.b6, "DECLINE", 0, bts);
+        return;
+    }
     if (lui == LUI_MENU) {
         draw_button(c, O.b1, "VS CPU", 0, bts);
         draw_button(c, O.b2, "SAME WI-FI", 0, bts);
         draw_button(c, O.b3, "USB CABLE", 0, bts);
-        draw_button(c, O.b4, "ONLINE", 0, bts);
+        {   /* ONLINE, with who's free right now */
+            int n = net_presence_available();
+            char lab[40];
+            if (n < 0) snprintf(lab, sizeof lab, show_online ? "ONLINE - CONNECTING" : "ONLINE");
+            else if (n == 0) snprintf(lab, sizeof lab, "ONLINE - NO ONE FREE");
+            else snprintf(lab, sizeof lab, "ONLINE - %d FREE", n);
+            draw_button(c, O.b4, lab, 0, bts);
+            if (n >= 0) {
+                int d = O.b4.h / 3;
+                Rc dot = { O.b4.x + O.b4.h / 2 - d / 2, O.b4.y + O.b4.h / 2 - d / 2, d, d };
+                rrect(c, dot, d / 2, n > 0 ? C_GREEN : C_DIM);
+            }
+        }
         draw_button(c, O.b5, server_host[0] ? "PUBLIC SERVERS" : "CUSTOM SERVER", 0, bts);
         draw_button(c, O.b6, "CANCEL", 0, bts);
     } else if (lui == LUI_CPU) {
@@ -1494,6 +1645,8 @@ static void *game_thread(void *arg) {
         }
         int active = app.resumed && app.win && !app.destroy;
         if (was_active && !active) {
+            net_presence_stop();
+            if (linked && net_kind() == NET_KIND_ONLINE) unlink_session("LINK ENDED");
             if (astream) AAudioStream_requestPause(astream);
             for (int i = 0; i < MAXP; i++) ptrs[i].active = 0;
             key_held = 0;
@@ -1520,6 +1673,7 @@ static void *game_thread(void *arg) {
         if (!was_active) {
             was_active = 1;
             if (!astream) audio_open(); else AAudioStream_requestStart(astream);
+            audio_last_progress_ns = 0;
             /* coming back mid-game: pause so the piece doesn't fall unseen */
             if (rom_ready && in_game_unpaused() && !tetris_is_2player()) queue_press(BTN_START);
             full_redraws_left = 4;
@@ -1534,6 +1688,7 @@ static void *game_thread(void *arg) {
             pthread_mutex_lock(&app.mu);
             continue;
         }
+        presence_service();
         link_service(now_ns());
         check_reset_hold(now_ns());
         /* new buttons only once the Game Boy has finished the previous frame,
@@ -1549,6 +1704,7 @@ static void *game_thread(void *arg) {
             prev_fall = fall;
         }
         render();
+        audio_service(now_ns());
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
         {   /* SPEED / LOAD readout: emulated frames per real second, and CPU time per loop */
             int64_t t = now_ns();
@@ -1574,6 +1730,7 @@ static void *game_thread(void *arg) {
     pthread_mutex_unlock(&app.mu);
     audio_close();
     gb_link_attach(NULL, NULL);
+    net_presence_stop();
     net_stop();
     net_thread_exit();
     linked = 0;

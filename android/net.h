@@ -10,6 +10,14 @@ enum { NET_KIND_NONE, NET_KIND_LAN, NET_KIND_ONLINE, NET_KIND_USB };
 
 int  net_start_lan(void);
 int  net_start_online(JavaVM *vm, const char *broker);   /* "" = built-in public brokers */
+/* online presence: listed as free / looking / busy while the app is open */
+int  net_presence_start(JavaVM *vm, const char *broker);
+void net_presence_stop(void);
+void net_presence_set_busy(int busy);
+int  net_presence_available(void);   /* free players right now, -1 = not connected */
+int  net_invite_pending(void);       /* seconds left to answer an invitation, 0 = none */
+void net_invite_answer(int accept);
+void net_test_search_timeout(int seconds);
 int  net_online_direct(void);        /* 1 when the online link runs phone-to-phone */
 void net_test_plain_brokers(int on);   /* tests: skip STUN */
 void net_test_no_direct(int on);      /* tests: broker relay only */

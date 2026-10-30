@@ -114,7 +114,7 @@ int net_start_lan(void) {
  * broker. TLS comes from the platform's own SSLSocket through JNI. */
 static JavaVM *jvm;
 static jobject j_sock, j_in, j_out;       /* global refs */
-static pthread_t ws_th; static int ws_running, ws_stop;
+static pthread_t ws_th; static int ws_running __attribute__((unused)), ws_stop;
 static int wake_pipe[2] = { -1, -1 };
 static pthread_mutex_t wmu = PTHREAD_MUTEX_INITIALIZER;   /* serialises socket writes */
 static char ws_host[128]; static int ws_port = 8883;      /* a broker chosen by the user ("" = built-in list) */
@@ -124,6 +124,8 @@ static struct { uint8_t d[32]; int n; } rxq[RXQ];
 static int rx_h, rx_t;
 static pthread_mutex_t rmu = PTHREAD_MUTEX_INITIALIZER;
 static JNIEnv *game_env;                    /* the game thread's JNI env (attached lazily) */
+static JNIEnv *genv(void);
+void net_presence_stop(void);
 
 /* public brokers, tried in order; both players walk the same list */
 static const struct { const char *host; int port; } BROKERS[] = {
@@ -135,7 +137,7 @@ static const struct { const char *host; int port; } STUNS[] = {
     { "stun.l.google.com", 19302 },
     { "stun.nextcloud.com", 443 },
 };
-#define TOPIC_BASE "greenscreen89/v3/"
+#define TOPIC_BASE "greenscreen89/v4/"
 static int test_mode_plain;                /* desktop test: no STUN */
 static int test_no_direct;                 /* desktop test: broker relay only */
 
@@ -317,10 +319,18 @@ static int mq_connect(JNIEnv *e) {
     uint8_t body[128], pkt[140]; int k = 0;
     k += mq_str(body + k, "MQTT");
     body[k++] = 4;            /* protocol level 3.1.1 */
-    body[k++] = 0x02;         /* clean session */
+#ifndef T89_WS_RELAY
+    body[k++] = 0x06;         /* clean session + will: the broker says "gone" for us if we drop */
+#else
+    body[k++] = 0x02;
+#endif
     body[k++] = 0; body[k++] = 30;   /* keepalive 30 s */
     char cid[32]; snprintf(cid, sizeof cid, "t89-%s", my_hex);
     k += mq_str(body + k, cid);
+#ifndef T89_WS_RELAY
+    { char wt[96], wm[40]; snprintf(wt, sizeof wt, TOPIC_BASE "lobby"); snprintf(wm, sizeof wm, "X %s", my_hex);
+      k += mq_str(body + k, wt); k += mq_str(body + k, wm); }
+#endif
     pkt[0] = 0x10; int h = 1 + mq_varlen(pkt + 1, k);
     memcpy(pkt + h, body, (size_t)k);
     return ws_write_raw(e, pkt, h + k);
@@ -447,21 +457,6 @@ static void make_token(void) {
     for (int i = 0; i < 8; i++) token[i] = (uint8_t)(h >> (8 * i));
 }
 
-static char t_lobby[96], t_me[96], t_peer[96];
-
-static void become_paired(const char *peer, const char *cl) {
-    snprintf(peer_hex, sizeof peer_hex, "%s", peer);
-    snprintf(t_peer, sizeof t_peer, TOPIC_BASE "p/%s", peer_hex);
-    parse_cands(cl);
-    make_token();
-    direct_ok = 0;
-    punch_until = mono_ns() + 6000000000LL;
-    last_udp_rx = 0;
-    __atomic_store_n(&paired, 1, __ATOMIC_RELEASE);
-    set_status(NET_CONNECTED, "LINKED ONLINE");
-}
-
-
 #ifdef T89_WS_RELAY
 /* ---- optional: a self-hosted relay instead of the public brokers ----
  * Build with -DT89_WS_RELAY='"relay.example.workers.dev"' to use the
@@ -569,51 +564,253 @@ done:
 }
 #endif
 
+static char t_lobby[96], t_me[96], t_peer[96];
+
+/* ---- presence + invitations (MQTT) ----
+ * While the app is open, it stays connected to a broker and says once every
+ * 10 s whether its player is free ('A' at the title / menus / between games),
+ * looking for a match ('L'), or busy ('B', mid-game or already linked).
+ * The broker announces 'X' (gone) for us if the connection drops (MQTT will).
+ * Matchmaking asks one free player at a time:
+ *   R <id> <addrs>   "want to link?"          (to that player's own topic)
+ *   Y <id> <addrs>   "yes" (auto when they're looking, else after they tap ACCEPT)
+ *   D <id>           "no / busy"
+ *   K <id>           "confirmed" - both sides are now paired
+ *   N <id>           "left"
+ * Data packets travel on the partner's topic until a direct UDP path works. */
+enum { SS_IDLE, SS_SEARCH, SS_ASK, SS_PROMPT, SS_CONFIRM, SS_PAIRED };
+#define MAXPEERS 64
+static struct { char id[17]; char st; int64_t seen; } peers[MAXPEERS];
+static pthread_mutex_t pmu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int pres_running, pres_connected, pres_busy;
+static int sess, sess_prev;                       /* SS_* (under pmu) */
+static char sess_peer[17], sess_cands[200];
+static int64_t sess_t, search_t0;
+static char declined[16][17]; static int ndeclined;
+static int64_t search_timeout_ns = 120000000000LL;
+static volatile int status_dirty = 1;             /* publish a heartbeat now */
+static char my_status = 'A';
+static int64_t note_until;                       /* keep a short message up before the next one */
+
+static void say(JNIEnv *e, const char *to, char what, const char *extra) {
+    char tp[96], m[240];
+    snprintf(tp, sizeof tp, TOPIC_BASE "p/%s", to);
+    if (extra && *extra) snprintf(m, sizeof m, "%c %s %s", what, my_hex, extra);
+    else snprintf(m, sizeof m, "%c %s", what, my_hex);
+    mq_publish_text(e, tp, m);
+}
+static void peer_seen(const char *id, char st) {
+    int64_t now = mono_ns(); int free_i = -1, old_i = 0;
+    for (int i = 0; i < MAXPEERS; i++) {
+        if (!strcmp(peers[i].id, id)) { peers[i].st = st; peers[i].seen = now; return; }
+        if (!peers[i].id[0] && free_i < 0) free_i = i;
+        if (peers[i].seen < peers[old_i].seen) old_i = i;
+    }
+    int i = free_i >= 0 ? free_i : old_i;
+    snprintf(peers[i].id, sizeof peers[i].id, "%s", id); peers[i].st = st; peers[i].seen = now;
+}
+static void peer_gone(const char *id) { for (int i = 0; i < MAXPEERS; i++) if (!strcmp(peers[i].id, id)) peers[i].id[0] = 0; }
+static int is_declined(const char *id) { for (int i = 0; i < ndeclined; i++) if (!strcmp(declined[i], id)) return 1; return 0; }
+/* next player to ask: someone looking first, then someone free; never one who said no this time */
+static int pick_peer(char *out) {
+    int64_t now = mono_ns(); int best = -1, best_rank = 0;
+    for (int i = 0; i < MAXPEERS; i++) {
+        if (!peers[i].id[0] || now - peers[i].seen > 25000000000LL) continue;
+        if (is_declined(peers[i].id)) continue;
+        int rank = peers[i].st == 'L' ? 3 : peers[i].st == 'A' ? 2 : 0;
+        if (!rank) continue;
+        if (rank > best_rank || (rank == best_rank && peers[i].seen > peers[best].seen)) { best = i; best_rank = rank; }
+    }
+    if (best < 0) return 0;
+    snprintf(out, 17, "%s", peers[best].id);
+    return 1;
+}
+static void become_paired(const char *peer, const char *cl) {
+    snprintf(peer_hex, sizeof peer_hex, "%s", peer);
+    snprintf(t_peer, sizeof t_peer, TOPIC_BASE "p/%s", peer_hex);
+    parse_cands(cl);
+    make_token();
+    direct_ok = 0;
+    memset(&direct_addr, 0, sizeof direct_addr);
+    punch_until = mono_ns() + 6000000000LL;
+    last_udp_rx = 0;
+    sess = SS_PAIRED;
+    __atomic_store_n(&paired, 1, __ATOMIC_RELEASE);
+    status_dirty = 1;
+    set_status(NET_CONNECTED, "LINKED ONLINE");
+}
+static void back_to_search_or_idle(void) {
+    sess = sess_prev == SS_SEARCH ? SS_SEARCH : SS_IDLE;
+    sess_peer[0] = 0; status_dirty = 1;
+}
+static char current_status(void) {
+    if (sess == SS_SEARCH || sess == SS_ASK) return 'L';
+    if (pres_busy || sess != SS_IDLE) return 'B';
+    return 'A';
+}
+
+/* one message from the broker (presence thread, pmu held) */
+static void pres_handle(JNIEnv *e, const char *topic, char *m) {
+    char who[17] = ""; const char *rest = "";
+    if (strlen(m) < 18 || m[1] != ' ') return;
+    memcpy(who, m + 2, 16); who[16] = 0;
+    if (m[18] == ' ') rest = m + 19;
+    if (!strcmp(who, my_hex)) return;
+    if (!strcmp(topic, t_lobby)) {
+        if (m[0] == 'H' && rest[0]) peer_seen(who, rest[0]);
+        else if (m[0] == 'X') peer_gone(who);
+        else if (m[0] == '?') status_dirty = 1;     /* a newcomer asks who's here: say hello now */
+        return;
+    }
+    if (strcmp(topic, t_me) != 0) return;
+    switch (m[0]) {
+    case 'R':                                      /* someone wants to link */
+        if (sess == SS_SEARCH || (sess == SS_ASK && strcmp(who, sess_peer) == 0 && strcmp(my_hex, who) > 0)) {
+            sess_prev = SS_SEARCH; sess = SS_CONFIRM; sess_t = mono_ns();
+            snprintf(sess_peer, sizeof sess_peer, "%s", who); snprintf(sess_cands, sizeof sess_cands, "%s", rest);
+            say(e, who, 'Y', my_cands);
+            set_status(NET_SEARCHING, "FOUND A PLAYER - LINKING...");
+        } else if (sess == SS_IDLE && !pres_busy && kind == NET_KIND_NONE) {
+            sess_prev = SS_IDLE; sess = SS_PROMPT; sess_t = mono_ns();
+            snprintf(sess_peer, sizeof sess_peer, "%s", who); snprintf(sess_cands, sizeof sess_cands, "%s", rest);
+            status_dirty = 1;                       /* busy while deciding */
+        } else if (sess == SS_ASK && !strcmp(who, sess_peer)) {
+            /* we asked each other at once: the higher id answers, the lower just waits for that answer */
+        } else say(e, who, 'D', NULL);
+        break;
+    case 'Y':                                      /* they said yes */
+        if (sess == SS_ASK && !strcmp(who, sess_peer)) {
+            say(e, who, 'K', NULL);
+            become_paired(who, rest);
+        } else say(e, who, 'N', NULL);             /* too late: we moved on */
+        break;
+    case 'K':
+        if (sess == SS_CONFIRM && !strcmp(who, sess_peer)) become_paired(who, sess_cands);
+        break;
+    case 'D':
+        if (sess == SS_ASK && !strcmp(who, sess_peer)) {
+            if (ndeclined < 16) snprintf(declined[ndeclined++], 17, "%s", who);
+            sess = SS_SEARCH; sess_peer[0] = 0;
+            note_until = mono_ns() + 2500000000LL;
+            set_status(NET_SEARCHING, "THAT PLAYER SAID NO - LOOKING AGAIN");
+        }
+        break;
+    case 'N':
+        if (sess == SS_PAIRED && !strcmp(who, peer_hex)) {
+            sess = SS_IDLE; paired = 0; status_dirty = 1;
+            if (kind == NET_KIND_ONLINE) set_status(NET_FAILED, "OTHER PLAYER LEFT");
+        } else if ((sess == SS_CONFIRM || sess == SS_PROMPT) && !strcmp(who, sess_peer)) {
+            back_to_search_or_idle();
+            if (sess == SS_IDLE && kind == NET_KIND_ONLINE) set_status(NET_FAILED, "THE OTHER PLAYER CANCELLED");
+        }
+        break;
+    }
+}
+
+/* timers, once per loop (pmu held) */
+static void pres_tick(JNIEnv *e, int64_t now) {
+    char buf[80];
+    if (sess == SS_PROMPT && now - sess_t > 20000000000LL) { say(e, sess_peer, 'D', NULL); back_to_search_or_idle(); }
+    if (sess == SS_CONFIRM && now - sess_t > 6000000000LL) {
+        back_to_search_or_idle();
+        if (kind == NET_KIND_ONLINE && sess == SS_IDLE) set_status(NET_FAILED, "COULDN'T LINK - TRY AGAIN");
+    }
+    if (sess == SS_ASK && now - sess_t > 25000000000LL) {
+        if (ndeclined < 16) snprintf(declined[ndeclined++], 17, "%s", sess_peer);
+        say(e, sess_peer, 'N', NULL);
+        sess = SS_SEARCH; sess_peer[0] = 0;
+    }
+    if (sess == SS_ASK) {
+        snprintf(buf, sizeof buf, "ASKING A PLAYER TO JOIN... %d", (int)(25 - (now - sess_t) / 1000000000LL));
+        set_status(NET_SEARCHING, buf);
+    }
+    if (sess == SS_SEARCH && now < note_until) return;
+    if (sess == SS_SEARCH) {
+        if (now - search_t0 > search_timeout_ns) {
+            sess = SS_IDLE; status_dirty = 1;
+            set_status(NET_FAILED, "NO ONE FOUND - TRY AGAIN LATER");
+            return;
+        }
+        char who[17];
+        if (pick_peer(who)) {
+            sess = SS_ASK; sess_t = now; sess_prev = SS_SEARCH;
+            snprintf(sess_peer, sizeof sess_peer, "%s", who);
+            say(e, who, 'R', my_cands);
+            set_status(NET_SEARCHING, "ASKING A PLAYER TO JOIN...");
+        } else {
+            int left = (int)((search_timeout_ns - (now - search_t0)) / 1000000000LL);
+            snprintf(buf, sizeof buf, "NO ONE FREE YET - WAITING %d:%02d", left / 60, left % 60);
+            set_status(NET_SEARCHING, buf);
+        }
+    }
+}
+
 static void *ws_thread(void *arg) {
     (void)arg;
     JNIEnv *e = NULL;
-    if ((*jvm)->AttachCurrentThread(jvm, &e, NULL) != JNI_OK || !e) { set_status(NET_FAILED, "INTERNAL ERROR"); ws_running = 0; return NULL; }
-    set_status(NET_SEARCHING, "CONNECTING...");
+    if ((*jvm)->AttachCurrentThread(jvm, &e, NULL) != JNI_OK || !e) { pres_running = 0; return NULL; }
     struct sockaddr_in pub;
     int have_pub = test_mode_plain ? 0 : (stun_public(&pub) == 0);
     gather_cands(have_pub, &pub);
-    int nb = (int)(sizeof BROKERS / sizeof BROKERS[0]);
-    int connected = 0;
-    for (int bi = 0; bi < (ws_host[0] ? 1 : nb) && !ws_stop && !connected; bi++) {
-        const char *h = ws_host[0] ? ws_host : BROKERS[bi].host;
-        int port = ws_host[0] ? ws_port : BROKERS[bi].port;
-        if (tls_open(e, h, port) != 0) continue;
-        int type, plen, total; uint8_t *pl;
-        if (mq_connect(e) == 0) {
-            int64_t t0 = mono_ns();
-            while (!ws_stop && mono_ns() - t0 < 6000000000LL) {
-                int r = mq_next(e, &type, &pl, &plen, &total);
-                if (r < 0) break;
-                if (r == 0) continue;
-                consume(total);
-                if ((type & 0xF0) == 0x20 && plen >= 2 && pl[1] == 0) { connected = 1; break; }
-                break;
-            }
-        }
-        if (!connected) close_sock(e);
-    }
-    if (!connected) { if (!ws_stop) set_status(NET_FAILED, "CAN'T REACH ANY SERVER"); goto done; }
     snprintf(t_lobby, sizeof t_lobby, TOPIC_BASE "lobby");
     snprintf(t_me, sizeof t_me, TOPIC_BASE "p/%s", my_hex);
-    if (mq_subscribe(e, t_lobby, t_me) != 0) { set_status(NET_FAILED, "CONNECTION FAILED"); goto done_sock; }
-    set_status(NET_SEARCHING, "WAITING FOR A PLAYER...");
-    {
-        int64_t last_w = 0, last_ping = mono_ns(), pend_t = 0, last_rx = mono_ns();
-        char pending[17] = "";
+    int nb = (int)(sizeof BROKERS / sizeof BROKERS[0]);
+    int64_t retry_delay = 2000000000LL;
+    while (!ws_stop) {
+        /* connect (walk the broker list) */
+        int connected = 0;
+        for (int bi = 0; bi < (ws_host[0] ? 1 : nb) && !ws_stop && !connected; bi++) {
+            const char *h = ws_host[0] ? ws_host : BROKERS[bi].host;
+            int port = ws_host[0] ? ws_port : BROKERS[bi].port;
+            if (kind == NET_KIND_ONLINE && sess == SS_SEARCH) {
+                char buf[80]; snprintf(buf, sizeof buf, "CONNECTING TO SERVER %d OF %d...", bi + 1, ws_host[0] ? 1 : nb);
+                set_status(NET_SEARCHING, buf);
+            }
+            if (tls_open(e, h, port) != 0) continue;
+            int type, plen, total; uint8_t *pl;
+            if (mq_connect(e) == 0) {
+                int64_t t0 = mono_ns();
+                while (!ws_stop && mono_ns() - t0 < 6000000000LL) {
+                    int r = mq_next(e, &type, &pl, &plen, &total);
+                    if (r < 0) break;
+                    if (r == 0) continue;
+                    consume(total);
+                    if ((type & 0xF0) == 0x20 && plen >= 2 && pl[1] == 0) connected = 1;
+                    break;
+                }
+            }
+            if (connected && mq_subscribe(e, t_lobby, t_me) != 0) connected = 0;
+            if (!connected) close_sock(e);
+        }
+        if (!connected) {
+            pres_connected = 0;
+            pthread_mutex_lock(&pmu);
+            if (kind == NET_KIND_ONLINE && sess != SS_PAIRED) { sess = SS_IDLE; set_status(NET_FAILED, "CAN'T REACH THE SERVERS - CHECK YOUR CONNECTION"); }
+            pthread_mutex_unlock(&pmu);
+            for (int64_t w = 0; w < retry_delay && !ws_stop; w += 100000000LL) { struct timespec ts = { 0, 100000000L }; nanosleep(&ts, NULL); }
+            if (retry_delay < 60000000000LL) retry_delay *= 2;
+            continue;
+        }
+        retry_delay = 2000000000LL;
+        pres_connected = 1; status_dirty = 1;
+        { char m[40]; snprintf(m, sizeof m, "? %s", my_hex); mq_publish_text(e, t_lobby, m); }
+        pthread_mutex_lock(&pmu);
+        if (kind == NET_KIND_ONLINE && sess == SS_SEARCH) set_status(NET_SEARCHING, "LOOKING FOR PLAYERS...");
+        pthread_mutex_unlock(&pmu);
+        int64_t last_h = 0, last_ping = mono_ns(), last_rx = mono_ns();
         while (!ws_stop) {
             int64_t now = mono_ns();
-            if (!paired && now - last_w > 1000000000LL) {
-                char m[40]; snprintf(m, sizeof m, "W %s", my_hex);
-                mq_publish_text(e, t_lobby, m); last_w = now;
+            pthread_mutex_lock(&pmu);
+            char st = current_status();
+            if (status_dirty || st != my_status || now - last_h > 10000000000LL) {
+                my_status = st; status_dirty = 0; last_h = now;
+                char m[40]; snprintf(m, sizeof m, "H %s %c", my_hex, st);
+                mq_publish_text(e, t_lobby, m);
             }
-            if (pending[0] && now - pend_t > 3000000000LL) pending[0] = 0;
+            pres_tick(e, now);
+            pthread_mutex_unlock(&pmu);
             if (now - last_ping > 15000000000LL) { uint8_t pr[2] = { 0xC0, 0 }; ws_write_raw(e, pr, 2); last_ping = now; }
-            if (now - last_rx > 45000000000LL) break;          /* broker went quiet */
+            if (now - last_rx > 45000000000LL) break;          /* broker went quiet: reconnect */
             int type, plen, total; uint8_t *pl;
             int r = mq_next(e, &type, &pl, &plen, &total);
             if (r < 0) break;
@@ -622,98 +819,186 @@ static void *ws_thread(void *arg) {
             if ((type & 0xF0) == 0x30 && plen >= 2) {
                 int tl = pl[0] << 8 | pl[1];
                 int hdr = 2 + tl + ((type & 6) ? 2 : 0);
-                if (hdr > plen) { consume(total); continue; }
-                char topic[128]; int cl = tl < 127 ? tl : 127; memcpy(topic, pl + 2, (size_t)cl); topic[cl] = 0;
-                uint8_t *d = pl + hdr; int dn = plen - hdr;
-                if (dn >= 5 && memcmp(d, MAGIC, 4) == 0 && d[4] == 'D') {
-                    if (paired && !strcmp(topic, t_me)) rx_push(d + 5, dn - 5);
-                } else if (dn > 2 && dn < 230) {
-                    char m[232]; memcpy(m, d, (size_t)dn); m[dn] = 0;
-                    char who[17] = ""; const char *rest = NULL;
-                    if (strlen(m) >= 18 && m[1] == ' ') { memcpy(who, m + 2, 16); who[16] = 0; rest = m[18] == ' ' ? m + 19 : ""; }
-                    if (who[0] && strcmp(who, my_hex) != 0) {
-                        char reply[240];
-                        if (m[0] == 'W' && !strcmp(topic, t_lobby)) {
-                            if (!paired && !pending[0] && strcmp(my_hex, who) < 0) {
-                                char tp[96]; snprintf(tp, sizeof tp, TOPIC_BASE "p/%s", who);
-                                snprintf(reply, sizeof reply, "I %s %s", my_hex, my_cands);
-                                mq_publish_text(e, tp, reply);
-                                snprintf(pending, sizeof pending, "%s", who); pend_t = mono_ns();
-                            }
-                        } else if (!strcmp(topic, t_me)) {
-                            char tp[96]; snprintf(tp, sizeof tp, TOPIC_BASE "p/%s", who);
-                            if (m[0] == 'I') {
-                                if (!paired) {
-                                    snprintf(reply, sizeof reply, "A %s %s", my_hex, my_cands);
-                                    mq_publish_text(e, tp, reply);
-                                    become_paired(who, rest);
-                                } else if (strcmp(who, peer_hex) != 0) {
-                                    snprintf(reply, sizeof reply, "N %s", my_hex); mq_publish_text(e, tp, reply);
-                                }
-                            } else if (m[0] == 'A') {
-                                if (!paired && !strcmp(pending, who)) { pending[0] = 0; become_paired(who, rest); }
-                                else if (!paired || strcmp(who, peer_hex) != 0) { snprintf(reply, sizeof reply, "N %s", my_hex); mq_publish_text(e, tp, reply); }
-                            } else if (m[0] == 'N') {
-                                if (!strcmp(pending, who)) pending[0] = 0;
-                                if (paired && !strcmp(who, peer_hex)) { set_status(NET_FAILED, "OTHER PLAYER LEFT"); consume(total); break; }
-                            }
-                        }
+                if (hdr <= plen) {
+                    char topic[128]; int cl = tl < 127 ? tl : 127; memcpy(topic, pl + 2, (size_t)cl); topic[cl] = 0;
+                    uint8_t *d = pl + hdr; int dn = plen - hdr;
+                    if (dn >= 5 && memcmp(d, MAGIC, 4) == 0 && d[4] == 'D') {
+                        if (paired && !strcmp(topic, t_me)) rx_push(d + 5, dn - 5);
+                    } else if (dn > 2 && dn < 230) {
+                        char m[232]; memcpy(m, d, (size_t)dn); m[dn] = 0;
+                        pthread_mutex_lock(&pmu);
+                        pres_handle(e, topic, m);
+                        pthread_mutex_unlock(&pmu);
                     }
                 }
             }
             consume(total);
         }
+        /* connection lost (or stopping) */
+        pres_connected = 0;
+        if (ws_stop) {
+            char m[40]; snprintf(m, sizeof m, "X %s", my_hex); mq_publish_text(e, t_lobby, m);
+            uint8_t dc[2] = { 0xE0, 0 }; ws_write_raw(e, dc, 2);
+        }
+        close_sock(e);
+        pthread_mutex_lock(&pmu);
+        if (sess == SS_PAIRED && kind == NET_KIND_ONLINE && !direct_ok) set_status(NET_FAILED, "CONNECTION LOST");
+        if (sess != SS_PAIRED) { if (kind == NET_KIND_ONLINE && sess != SS_IDLE) sess = SS_SEARCH; }
+        pthread_mutex_unlock(&pmu);
     }
-    if (net_state() != NET_FAILED && !ws_stop) set_status(NET_FAILED, "CONNECTION LOST");
-done_sock:
-    if (!ws_stop) { uint8_t dc[2] = { 0xE0, 0 }; ws_write_raw(e, dc, 2); }
-    close_sock(e);
-done:
     (*jvm)->DetachCurrentThread(jvm);
-    ws_running = 0;
+    pres_running = 0;
     if (wake_pipe[1] >= 0) { char b = 1; if (write(wake_pipe[1], &b, 1) < 0) {} }
     return NULL;
 }
 
-/* host "" = built-in list of public brokers; "host[:port]" = that broker */
-int net_start_online(JavaVM *vm, const char *host) {
-    net_stop();
-    jvm = vm;
-    snprintf(ws_host, sizeof ws_host, "%s", host ? host : "");
-    ws_port = 8883;
-    char *colon = strchr(ws_host, ':');
-    if (colon) { ws_port = atoi(colon + 1); *colon = 0; if (ws_port <= 0) ws_port = 8883; }
+static void online_socket_open(void) {
     if (wake_pipe[0] < 0) {
         if (pipe(wake_pipe) == 0) {
             fcntl(wake_pipe[0], F_SETFL, fcntl(wake_pipe[0], F_GETFL) | O_NONBLOCK);
             fcntl(wake_pipe[1], F_SETFL, fcntl(wake_pipe[1], F_GETFL) | O_NONBLOCK);
         }
     }
-    uint32_t a = rand32(), b = rand32();
-    snprintf(my_hex, sizeof my_hex, "%08x%08x", a, b);
-    paired = 0; direct_ok = 0; ncands = 0; peer_hex[0] = 0;
 #ifdef T89_WS_RELAY
     o_fd = -1;                      /* the relay carries everything: no direct path */
 #else
-    o_fd = socket(AF_INET, SOCK_DGRAM, 0);
-#endif
-    if (o_fd >= 0) {
-        struct sockaddr_in me; memset(&me, 0, sizeof me);
-        me.sin_family = AF_INET; me.sin_addr.s_addr = htonl(INADDR_ANY); me.sin_port = 0;
-        bind(o_fd, (struct sockaddr *)&me, sizeof me);
-        fcntl(o_fd, F_SETFL, fcntl(o_fd, F_GETFL) | O_NONBLOCK);
+    if (o_fd < 0) {
+        o_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (o_fd >= 0) {
+            struct sockaddr_in me; memset(&me, 0, sizeof me);
+            me.sin_family = AF_INET; me.sin_addr.s_addr = htonl(INADDR_ANY); me.sin_port = 0;
+            bind(o_fd, (struct sockaddr *)&me, sizeof me);
+            fcntl(o_fd, F_SETFL, fcntl(o_fd, F_GETFL) | O_NONBLOCK);
+        }
     }
+#endif
+}
+static void set_broker(const char *host) {
+    snprintf(ws_host, sizeof ws_host, "%s", host ? host : "");
+    ws_port = 8883;
+    char *colon = strchr(ws_host, ':');
+    if (colon) { ws_port = atoi(colon + 1); *colon = 0; if (ws_port <= 0) ws_port = 8883; }
+}
+
+#ifndef T89_WS_RELAY
+/* keep this phone listed as online (call when the app comes to the front) */
+int net_presence_start(JavaVM *vm, const char *broker) {
+    char want[128]; snprintf(want, sizeof want, "%s", broker ? broker : "");
+    { char cur[140]; snprintf(cur, sizeof cur, "%s%s%d", ws_host, ws_host[0] ? ":" : "", ws_port);
+      if (pres_running && strcmp(want, ws_host[0] ? cur : "") != 0 && strcmp(want, ws_host) != 0) net_presence_stop(); }
+    if (pres_running) return 0;
+    if (!vm) return -1;
+    jvm = vm;
+    set_broker(want);
+    if (!my_hex[0]) { uint32_t a = rand32(), b = rand32(); snprintf(my_hex, sizeof my_hex, "%08x%08x", a, b); }
+    online_socket_open();
+    memset(peers, 0, sizeof peers);
+    pthread_mutex_lock(&pmu);
+    sess = SS_IDLE; paired = 0; direct_ok = 0; status_dirty = 1;
+    pthread_mutex_unlock(&pmu);
+    ws_stop = 0; pres_running = 1; pres_connected = 0;
+    if (pthread_create(&ws_th, NULL, ws_thread, NULL) != 0) { pres_running = 0; return -1; }
+    return 0;
+}
+/* leave (app going to the background or closing) */
+void net_presence_stop(void) {
+    if (kind == NET_KIND_ONLINE) net_stop();
+    if (!pres_running && !ws_th) return;
+    ws_stop = 1;
+    if (j_sock && genv()) {
+        /* say goodbye, then closing the socket unblocks the reader */
+        char m[40]; snprintf(m, sizeof m, "X %s", my_hex); mq_publish_text(game_env, t_lobby, m);
+        pthread_mutex_lock(&wmu);
+        if (j_sock) {
+            jclass cSock = (*game_env)->FindClass(game_env, "java/net/Socket");
+            (*game_env)->CallVoidMethod(game_env, j_sock, (*game_env)->GetMethodID(game_env, cSock, "close", "()V"));
+            jexc(game_env);
+        }
+        pthread_mutex_unlock(&wmu);
+    }
+    if (ws_th) pthread_join(ws_th, NULL);
+    ws_th = 0; pres_running = 0; pres_connected = 0;
+    if (o_fd >= 0) { close(o_fd); o_fd = -1; }
+}
+void net_presence_set_busy(int busy) {
+    if (pres_busy != busy) { pres_busy = busy; status_dirty = 1; }
+}
+/* players free to link right now (not counting us); -1 while not connected */
+int net_presence_available(void) {
+    if (!pres_connected) return -1;
+    int n = 0; int64_t now = mono_ns();
+    pthread_mutex_lock(&pmu);
+    for (int i = 0; i < MAXPEERS; i++)
+        if (peers[i].id[0] && now - peers[i].seen < 25000000000LL && (peers[i].st == 'A' || peers[i].st == 'L')) n++;
+    pthread_mutex_unlock(&pmu);
+    return n;
+}
+/* an invitation waiting for this player's answer: returns seconds left, or 0 */
+int net_invite_pending(void) {
+    pthread_mutex_lock(&pmu);
+    int r = sess == SS_PROMPT ? 20 - (int)((mono_ns() - sess_t) / 1000000000LL) : 0;
+    pthread_mutex_unlock(&pmu);
+    return r > 0 ? r : 0;
+}
+void net_invite_answer(int accept) {
+    JNIEnv *e = genv();
+    pthread_mutex_lock(&pmu);
+    if (sess == SS_PROMPT) {
+        if (accept) {
+            if (e) say(e, sess_peer, 'Y', my_cands);
+            sess = SS_CONFIRM; sess_t = mono_ns(); sess_prev = SS_IDLE;
+            kind = NET_KIND_ONLINE; rx_h = rx_t = 0;
+            set_status(NET_SEARCHING, "LINKING...");
+        } else {
+            if (e) say(e, sess_peer, 'D', NULL);
+            sess = SS_IDLE; sess_peer[0] = 0; status_dirty = 1;
+        }
+    }
+    pthread_mutex_unlock(&pmu);
+}
+void net_test_search_timeout(int seconds) { search_timeout_ns = (int64_t)seconds * 1000000000LL; }
+
+/* tap on ONLINE: find a partner among the players who are free */
+int net_start_online(JavaVM *vm, const char *broker) {
+    /* someone already asked us to play: searching means yes */
+    if (pres_running && net_invite_pending()) { net_invite_answer(1); return 0; }
+    net_stop();
+    net_presence_start(vm, broker);
+    if (!pres_running) { kind = NET_KIND_ONLINE; set_status(NET_FAILED, "INTERNAL ERROR"); return -1; }
+    pthread_mutex_lock(&pmu);
+    kind = NET_KIND_ONLINE;
+    rx_h = rx_t = 0; ndeclined = 0;
+    paired = 0; direct_ok = 0;
+    sess = SS_SEARCH; sess_prev = SS_SEARCH; search_t0 = mono_ns(); status_dirty = 1;
+    set_status(NET_SEARCHING, pres_connected ? "LOOKING FOR PLAYERS..." : "CONNECTING TO SERVER...");
+    pthread_mutex_unlock(&pmu);
+    return 0;
+}
+#else
+int net_presence_start(JavaVM *vm, const char *broker) { (void)vm; (void)broker; return 0; }
+void net_presence_stop(void) { if (kind == NET_KIND_ONLINE) net_stop(); }
+void net_presence_set_busy(int busy) { (void)busy; }
+int net_presence_available(void) { return -1; }
+int net_invite_pending(void) { return 0; }
+void net_invite_answer(int accept) { (void)accept; }
+void net_test_search_timeout(int seconds) { (void)seconds; }
+/* the private relay: pairs whoever is waiting in the room */
+int net_start_online(JavaVM *vm, const char *host) {
+    net_stop();
+    jvm = vm;
+    set_broker(host);
+    uint32_t a = rand32(), b = rand32();
+    snprintf(my_hex, sizeof my_hex, "%08x%08x", a, b);
+    paired = 0; direct_ok = 0; ncands = 0; peer_hex[0] = 0;
+    online_socket_open();
     rx_h = rx_t = 0; ws_stop = 0; ws_running = 1;
     kind = NET_KIND_ONLINE;
     set_status(NET_SEARCHING, "CONNECTING...");
-#ifdef T89_WS_RELAY
-    void *(*thread_fn)(void *) = ws_relay_thread;
-#else
-    void *(*thread_fn)(void *) = ws_thread;
-#endif
-    if (pthread_create(&ws_th, NULL, thread_fn, NULL) != 0) { ws_running = 0; set_status(NET_FAILED, "INTERNAL ERROR"); return -1; }
+    if (pthread_create(&ws_th, NULL, ws_relay_thread, NULL) != 0) { ws_running = 0; set_status(NET_FAILED, "INTERNAL ERROR"); return -1; }
     return 0;
 }
+#endif
+
 void net_test_plain_brokers(int on) { test_mode_plain = on; }
 void net_test_no_direct(int on) { test_no_direct = on; }
 static int test_block_udp;
@@ -747,9 +1032,10 @@ static int online_udp_recv(uint8_t *buf, int max) {
         if (test_block_udp) continue;
         if (!paired || test_no_direct || g < 13 || memcmp(m, MAGIC, 4) != 0 || memcmp(m + 5, token, 8) != 0) continue;
         int64_t now = mono_ns();
-        if (m[4] == 'P') { online_udp_send(&from, 'Q', NULL, 0); continue; }
+        if (m[4] == 'P') { online_udp_send(&from, 'Q', NULL, 0); if (!direct_addr.sin_port) direct_addr = from; continue; }
         if (m[4] == 'Q') { direct_addr = from; last_udp_rx = now; if (!direct_ok) { direct_ok = 1; last_keep = 0; } continue; }
-        if (from.sin_addr.s_addr != direct_addr.sin_addr.s_addr || from.sin_port != direct_addr.sin_port) continue;
+        /* data / keepalives with our pair's token count from wherever they come (NAT ports can change) */
+        if (!direct_addr.sin_port) direct_addr = from;
         last_udp_rx = now;
         if (m[4] == 'K') continue;
         if (m[4] == 'D') { int n = (int)g - 13; if (n > max) n = max; memcpy(buf, m + 13, (size_t)n); return n; }
@@ -1063,8 +1349,17 @@ void net_stop(void) {
     if (kind == NET_KIND_ONLINE) {
         /* tell the other player right away (the link layer's BYE may not get through the broker in time) */
 #ifndef T89_WS_RELAY
-        if (paired && j_out) { JNIEnv *e = genv(); char m[40]; snprintf(m, sizeof m, "N %s", my_hex); if (e) mq_publish_text(e, t_peer, m); }
-#endif
+        /* end this online session; the presence connection stays up */
+        JNIEnv *e = genv();
+        pthread_mutex_lock(&pmu);
+        if (e && j_out) {
+            if (sess == SS_PAIRED && paired) say(e, peer_hex, 'N', NULL);
+            else if (sess == SS_ASK || sess == SS_CONFIRM) say(e, sess_peer, 'N', NULL);
+        }
+        sess = SS_IDLE; sess_peer[0] = 0; status_dirty = 1;
+        paired = 0; direct_ok = 0;
+        pthread_mutex_unlock(&pmu);
+#else
         ws_stop = 1;
         /* closing the socket unblocks the reader */
         if (j_sock && genv()) {
@@ -1080,6 +1375,7 @@ void net_stop(void) {
         ws_th = 0; ws_running = 0;
         if (o_fd >= 0) { close(o_fd); o_fd = -1; }
         paired = 0; direct_ok = 0;
+#endif
     }
     if (kind == NET_KIND_USB) usb_close();
     kind = NET_KIND_NONE;

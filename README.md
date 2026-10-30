@@ -48,7 +48,7 @@ On controllers, R1 is hard drop.
 - **VS CPU**: Easy, Normal or Hard bot. It runs on a second emulated Game Boy that the bot plays through its buttons.
 - **Same Wi-Fi**: automatic pairing over UDP.
 - **USB cable**: two phones with one USB-C cable (Android Open Accessory).
-- **Online**: matchmaking through public open-source MQTT brokers, then a direct phone-to-phone connection when the networks allow it (badge shows `LINK P2P`). If not, packets go through the broker. **Custom server** accepts any TLS MQTT broker address from the clipboard.
+- **Online**: while the app is open you're listed as online. You show as *free* at the title screen, in menus, and between games, and as *busy* during a solo game. The ONLINE button shows a green dot and how many players are free right now. Tapping it asks free players one at a time; they get an ACCEPT / DECLINE prompt, and nobody is interrupted mid-game. Two players searching at once are matched automatically. After 2 minutes with no match, the search stops and says so. Matchmaking runs through public open-source MQTT brokers, then switches to a direct phone-to-phone connection when the networks allow it (badge shows `LINK P2P`); otherwise packets go through the broker. Turn the listing off with **SHOW ME ONLINE** in CONTROLS. **Custom server** accepts any TLS MQTT broker address from the clipboard.
 
 ## Loading your ROM
 
@@ -101,7 +101,10 @@ bash test/build_sim.sh && ./build/sim /tmp/out             # single-player scrip
 ./build/sim /tmp/out cpu 2 1                               # VS CPU (Hard), one round
 ./build/sim /tmp/out norom                                 # first-run ROM screen
 bash test/build_linksim.sh && python3 test/cpubot_match.py "$T89_ROM" 2 1 2   # bot vs bot over the link
-bash test/mqtt/run.sh                                      # online matchmaking: direct, relay, fallback
+./build/sim /tmp/out audio                                # sound survives app switching, device changes, menus (SIM_AUDIO_STRICT=1)
+./build/sim /tmp/out onlineui                             # online dot, busy status, invitation prompt
+bash test/mqtt/run.sh                                      # online connection: direct, relay, fallback
+bash test/mqtt/presence_run.sh                             # who's free, invitations, declines, timeouts
 ```
 
 ## License

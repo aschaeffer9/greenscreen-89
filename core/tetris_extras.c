@@ -68,3 +68,14 @@ int tetris_is_2player(void) { return gb_peek(0xFFC5) != 0; }
  * transfer is in flight - as on a real cable. During play ($1A) the game
  * only sends again after the previous reply, so it tolerates lag freely. */
 int tetris_link_hold_while_waiting(void) { return gb_peek(hGameState) != 0x1A; }
+
+/* mid single-player game (for the online "busy" status): playing, paused,
+ * between B-type levels, or typing a name for the high-score list.
+ * Title, menus, game over and the celebration scenes count as free. */
+int tetris_single_busy(void) {
+    if (tetris_is_2player()) return 0;
+    switch (gb_peek(hGameState)) {
+    case 0x00: case 0x04: case 0x05: case 0x0a: case 0x0b: case 0x15: return 1;
+    }
+    return 0;
+}

@@ -77,8 +77,19 @@ int32_t AConfiguration_getDensity(AConfiguration *c) { return sim_density; }
 void ANativeActivity_finish(ANativeActivity *a) { finished = 1; }
 void ANativeActivity_setWindowFlags(ANativeActivity *a, uint32_t add, uint32_t rem) {}
 
-struct AAudioStreamStruct { int started; };
+/* AAudio fake. By default a simple sink; with SIM_AUDIO_STRICT it behaves like
+ * the real thing: pause/stop take effect a little later (requestStart while
+ * PAUSING fails with INVALID_STATE), a non-started stream doesn't drain so
+ * writes time out, and a stream can be DISCONNECTED (headphones, Bluetooth). */
+struct AAudioStreamStruct { int state; int64_t state_at; int next_state; int64_t played, written, t_start; };
 struct AAudioStreamBuilderStruct { int d; };
+static int64_t sim_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec; }
+static int strict_audio(void) { return getenv("SIM_AUDIO_STRICT") != NULL; }
+static int64_t audible_frames;            /* frames the fake device actually played */
+static AAudioStream *sim_stream;          /* the open stream (tests can disconnect it) */
+static void st_settle(AAudioStream *s) {
+    if (s->next_state && sim_ns() >= s->state_at) { s->state = s->next_state; s->next_state = 0; }
+}
 aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder **b) { *b = calloc(1, sizeof **b); return 0; }
 void AAudioStreamBuilder_setDirection(AAudioStreamBuilder *b, aaudio_direction_t d) {}
 void AAudioStreamBuilder_setSampleRate(AAudioStreamBuilder *b, int32_t r) {}
@@ -88,26 +99,74 @@ void AAudioStreamBuilder_setPerformanceMode(AAudioStreamBuilder *b, aaudio_perfo
 void AAudioStreamBuilder_setSharingMode(AAudioStreamBuilder *b, aaudio_sharing_mode_t m) {}
 void AAudioStreamBuilder_setUsage(AAudioStreamBuilder *b, aaudio_usage_t u) {}
 void AAudioStreamBuilder_setContentType(AAudioStreamBuilder *b, aaudio_content_type_t c) {}
-aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b, AAudioStream **s) { *s = calloc(1, sizeof **s); return 0; }
+aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b, AAudioStream **s) {
+    *s = calloc(1, sizeof **s); (*s)->state = AAUDIO_STREAM_STATE_OPEN; sim_stream = *s; return 0; }
 aaudio_result_t AAudioStreamBuilder_delete(AAudioStreamBuilder *b) { free(b); return 0; }
 int32_t AAudioStream_getSampleRate(AAudioStream *s) { return 48000; }
 int32_t AAudioStream_getChannelCount(AAudioStream *s) { return 2; }
 aaudio_format_t AAudioStream_getFormat(AAudioStream *s) { return AAUDIO_FORMAT_PCM_I16; }
 int32_t AAudioStream_getFramesPerBurst(AAudioStream *s) { return 192; }
 aaudio_result_t AAudioStream_setBufferSizeInFrames(AAudioStream *s, int32_t n) { return n; }
-aaudio_result_t AAudioStream_requestStart(AAudioStream *s) { s->started = 1; return 0; }
-aaudio_result_t AAudioStream_requestPause(AAudioStream *s) { s->started = 0; return 0; }
-aaudio_result_t AAudioStream_requestStop(AAudioStream *s) { s->started = 0; return 0; }
-aaudio_result_t AAudioStream_close(AAudioStream *s) { free(s); return 0; }
+aaudio_stream_state_t AAudioStream_getState(AAudioStream *s) { st_settle(s); return s->state; }
+int64_t AAudioStream_getFramesRead(AAudioStream *s) { return s->played; }
+aaudio_result_t AAudioStream_requestStart(AAudioStream *s) {
+    st_settle(s);
+    if (s->state == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
+    if (strict_audio() && (s->state == AAUDIO_STREAM_STATE_PAUSING || s->state == AAUDIO_STREAM_STATE_STOPPING)) return AAUDIO_ERROR_INVALID_STATE;
+    s->state = AAUDIO_STREAM_STATE_STARTED; s->next_state = 0; s->t_start = 0; return 0;
+}
+static aaudio_result_t req_halt(AAudioStream *s, int mid, int end) {
+    st_settle(s);
+    if (s->state == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
+    if (strict_audio()) { s->state = mid; s->next_state = end; s->state_at = sim_ns() + 40000000LL; }
+    else s->state = end;
+    return 0;
+}
+aaudio_result_t AAudioStream_requestPause(AAudioStream *s) { return req_halt(s, AAUDIO_STREAM_STATE_PAUSING, AAUDIO_STREAM_STATE_PAUSED); }
+aaudio_result_t AAudioStream_requestStop(AAudioStream *s) { return req_halt(s, AAUDIO_STREAM_STATE_STOPPING, AAUDIO_STREAM_STATE_STOPPED); }
+aaudio_result_t AAudioStream_close(AAudioStream *s) { if (s == sim_stream) sim_stream = NULL; free(s); return 0; }
+static void sim_audio_disconnect(void) { if (sim_stream) sim_stream->state = AAUDIO_STREAM_STATE_DISCONNECTED; }
 aaudio_result_t AAudioStream_write(AAudioStream *s, const void *buf, int32_t n, int64_t to) {
+    st_settle(s);
+    if (strict_audio()) {
+        if (s->state == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
+        int64_t tn = sim_ns();
+        if (s->state == AAUDIO_STREAM_STATE_STARTED) {
+            if (!s->t_start) s->t_start = tn - s->played * 1000000000LL / 48000;
+            int64_t can = (tn - s->t_start) * 48000 / 1000000000LL;     /* device position */
+            if (can > s->written) { s->t_start = tn - s->written * 1000000000LL / 48000; can = s->written; }   /* underrun */
+            s->played = can;
+        }
+        /* blocking write, like AAudio: wait for room until everything is in or the timeout passes */
+        int done = 0; int64_t deadline = tn + to;
+        for (;;) {
+            st_settle(s);
+            if (s->state == AAUDIO_STREAM_STATE_DISCONNECTED) return done ? done : AAUDIO_ERROR_DISCONNECTED;
+            int64_t now2 = sim_ns();
+            if (s->state == AAUDIO_STREAM_STATE_STARTED) {
+                if (!s->t_start) s->t_start = now2 - s->played * 1000000000LL / 48000;
+                int64_t can = (now2 - s->t_start) * 48000 / 1000000000LL;
+                if (can > s->written) { s->t_start = now2 - s->written * 1000000000LL / 48000; can = s->written; }
+                s->played = can;
+            }
+            int64_t room = 2048 - (s->written - s->played);
+            if (room > 0) {
+                int k = room < n - done ? (int)room : n - done;
+                s->written += k; done += k;
+                if (audio_out) fwrite((const char *)buf + (size_t)(done - k) * 4, 4, (size_t)k, audio_out);
+                audio_frames += k; audible_frames += k;
+                if (done == n) return n;
+            }
+            if (now2 >= deadline) return done;
+            struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL);
+        }
+    }
     if (audio_out) fwrite(buf, 4, (size_t)n, audio_out);
     audio_frames += n;
-    /* simulate the device consuming at 48 kHz, 8x faster than real time */
     if (getenv("SIM_AUDIO_REALTIME")) {
-        /* like AAudio: a buffer drained at 48 kHz; write blocks only while it's full */
+        /* a buffer drained at 48 kHz; write blocks only while it's full */
         static int64_t written, t_start;
-        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t tn = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t tn = sim_ns();
         if (!t_start) t_start = tn;
         written += n;
         int64_t played = (tn - t_start) * 48000 / 1000000000LL;
@@ -203,6 +262,8 @@ static int run_2p(char role, int listen, int send);
 static int run_cpu(int level, int rounds);
 static int run_norom(void);
 static int run_ctl(void);
+static int run_audio(void);
+static int run_online_ui(void);
 /* the tester's own ROM: T89_ROM=/path/to/rom.gb */
 static const char *rom_src(void) { return getenv("T89_ROM") ? getenv("T89_ROM") : "rom/Tetris (World) (Rev A).gb"; }
 static void install_rom(void) {
@@ -214,6 +275,8 @@ int main(int argc, char **argv) {
     outdir = argv[1];
     if (argc > 2 && !strcmp(argv[2], "norom")) return run_norom();
     if (argc > 2 && !strcmp(argv[2], "ctl")) { install_rom(); return run_ctl(); }
+    if (argc > 2 && !strcmp(argv[2], "audio")) { install_rom(); return run_audio(); }
+    if (argc > 2 && !strcmp(argv[2], "onlineui")) { install_rom(); return run_online_ui(); }
     install_rom();
     if (argc > 6) return run_2p(argv[4][0], atoi(argv[5]), atoi(argv[6]));
     if (argc > 2 && !strcmp(argv[2], "cpu")) return run_cpu(argc > 3 ? atoi(argv[3]) : 2, argc > 4 ? atoi(argv[4]) : 2);
@@ -536,7 +599,10 @@ static int run_norom(void) {
       if (system(cmd) != 0) fprintf(stderr, "zip failed\n"); }
     ROM_DIRS[1] = d3;
     tap(O.b3.x + O.b3.w / 2, O.b3.y + O.b3.h / 2); wait_frames(5);
-    fprintf(stderr, "scan zip: rom_ready=%d overlay=%d saved copy=%s\n", rom_ready, lui, access(p, 0) == 0 ? "yes" : "no");
+    fprintf(stderr, "scan zip: animation playing=%d rom_ready=%d saved copy=%s\n", insert_anim_t0 != 0, rom_ready, access(p, 0) == 0 ? "yes" : "no");
+    msleep(500); shot("r3a_insert"); msleep(800); shot("r3b_click"); msleep(600); shot("r3c_reading");
+    wait_frames(120);
+    fprintf(stderr, "after the animation: rom_ready=%d overlay=%d\n", rom_ready, lui);
     wait_frames(330);
     fprintf(stderr, "game booted: state %02x (copyright 24/25 or title 07)\n", gb_peek(0xFFE1));
     shot("r3_booted");
@@ -551,7 +617,9 @@ static int run_norom(void) {
     fprintf(stderr, "waiting: rom_ready=%d\n", rom_ready);
     { uint8_t r[ROM_SIZE]; rom_check_file(rom_src(), r); rom_save(p, r); }
     wait_frames(60);
-    fprintf(stderr, "picked up import from elsewhere: rom_ready=%d\n", rom_ready);
+    fprintf(stderr, "picked up import from elsewhere: animation=%d rom_ready=%d\n", insert_anim_t0 != 0, rom_ready);
+    tap(L.screen.x + L.screen.w / 2, L.screen.y + L.screen.h / 2); wait_frames(5);
+    fprintf(stderr, "tap skips the animation: rom_ready=%d\n", rom_ready);
     destroy();
     return 0;
 }
@@ -608,6 +676,98 @@ static int run_ctl(void) {
     destroy();
     create(1080, 2340); wait_frames(10);
     fprintf(stderr, "after relaunch: swipe %d flick %d (want 10 10)\n", sens_touch, sens_flick);
+    destroy();
+    return 0;
+}
+
+/* ---------------- audio robustness: app switching, quick in/out, device changes ---------------- */
+static int64_t audible_over(int frames) {
+    int64_t a0 = audible_frames; int64_t t0 = sim_ns();
+    wait_frames(frames);
+    double secs = (double)(sim_ns() - t0) / 1e9;
+    return (int64_t)((double)(audible_frames - a0) / secs);    /* frames played per second */
+}
+static int run_audio(void) {
+    char sp[512]; snprintf(sp, sizeof sp, "%s/tetris_state.bin", outdir); remove(sp);
+    win.copyback = 1;
+    create(1080, 2340);
+    wait_frames(120);
+    fprintf(stderr, "start: %lld frames/s audible (want ~47000-48000)\n", (long long)audible_over(120));
+    /* 1: leave and come right back, ten times (requestStart lands while the stream is still pausing) */
+    for (int i = 0; i < 10; i++) {
+        cbs.onPause(&act); msleep(5 + 3 * i); cbs.onResume(&act); msleep(10);
+    }
+    { int64_t t0 = sim_ns(); int64_t a0 = audible_frames;
+      while (audible_frames == a0 && sim_ns() - t0 < 3000000000LL) msleep(1);
+      fprintf(stderr, "after 10 quick in/out: sound back after %.0f ms\n", (double)(sim_ns() - t0) / 1e6); }
+    fprintf(stderr, "after 10 quick in/out: %lld frames/s audible\n", (long long)audible_over(120));
+    /* 2: a slow away-and-back with the window going away (screen off) */
+    cbs.onPause(&act); cbs.onNativeWindowDestroyed(&act, &win); msleep(300);
+    cbs.onNativeWindowCreated(&act, &win); cbs.onResume(&act);
+    fprintf(stderr, "after screen off/on: %lld frames/s audible\n", (long long)audible_over(120));
+    /* 3: the audio device goes away (headphones unplugged / Bluetooth) */
+    sim_audio_disconnect();
+    fprintf(stderr, "after audio device change: %lld frames/s audible\n", (long long)audible_over(120));
+    /* 4: in and out of the link menu and the controls panel */
+    for (int i = 0; i < 6; i++) {
+        tap_gb(120, 115); wait_frames(5); key(AKEYCODE_BACK); wait_frames(5);
+        tap(L.bctl.x + L.bctl.w / 2, L.bctl.y + L.bctl.h / 2); wait_frames(5); key(AKEYCODE_BACK); wait_frames(5);
+    }
+    fprintf(stderr, "after menus in/out: %lld frames/s audible\n", (long long)audible_over(120));
+    destroy();
+    return 0;
+}
+
+/* ---------------- online presence UI (network faked: net.c's state set directly) ---------------- */
+static int run_online_ui(void) {
+    char sp[512]; snprintf(sp, sizeof sp, "%s/tetris_state.bin", outdir); remove(sp);
+    win.copyback = 1;
+    create(1080, 2340);
+    wait_frames(330);
+    tap_gb(80, 40); wait_frames(40);
+    /* pretend the presence connection is up with two free players and one busy */
+    pres_connected = 1;
+    pthread_mutex_lock(&pmu); peer_seen("aaaaaaaaaaaaaaaa", 'A'); peer_seen("bbbbbbbbbbbbbbbb", 'L'); peer_seen("cccccccccccccccc", 'B'); pthread_mutex_unlock(&pmu);
+    tap_gb(120, 115); wait_frames(10);
+    fprintf(stderr, "link menu open: %d, free players shown: %d\n", lui == LUI_MENU, net_presence_available());
+    shot("o1_menu_dot");
+    key(AKEYCODE_BACK); wait_frames(5);
+    /* busy while playing solo: start a game */
+    for (int i = 0; i < 5 && gb_peek(0xFFE1) != 0x00; i++) { key(AKEYCODE_ENTER); wait_frames(40); }
+    wait_frames(5);
+    fprintf(stderr, "in a solo game: busy=%d (want 1)\n", pres_busy);
+    key(AKEYCODE_ENTER); wait_frames(10);   /* pause: still busy */
+    fprintf(stderr, "paused solo game: busy=%d (want 1)\n", pres_busy);
+    /* an invitation arriving mid-game must not pop up */
+    pthread_mutex_lock(&pmu); sess = SS_PROMPT; sess_t = mono_ns(); snprintf(sess_peer, sizeof sess_peer, "aaaaaaaaaaaaaaaa"); pthread_mutex_unlock(&pmu);
+    wait_frames(5);
+    fprintf(stderr, "invitation while mid-game: overlay=%d (in-game overlays are suppressed? %s)\n", lui, lui == LUI_INVITE ? "NO, it popped up" : "yes");
+    pthread_mutex_lock(&pmu); sess = SS_IDLE; pthread_mutex_unlock(&pmu);
+    /* back to the title: free */
+    { float bx = L.bstart.x + L.bstart.w / 2, by = L.bstart.y + L.bstart.h / 2;
+      touch(AMOTION_EVENT_ACTION_DOWN, 0, bx, by); msleep(1500); touch(AMOTION_EVENT_ACTION_UP, 0, bx, by); }
+    wait_frames(400); key(AKEYCODE_ENTER); wait_frames(40);
+    fprintf(stderr, "back at title (state %02x): busy=%d (want 0)\n", gb_peek(0xFFE1), pres_busy);
+    /* an invitation at the title pops up */
+    pthread_mutex_lock(&pmu); sess = SS_PROMPT; sess_t = mono_ns(); snprintf(sess_peer, sizeof sess_peer, "aaaaaaaaaaaaaaaa"); pthread_mutex_unlock(&pmu);
+    wait_frames(10);
+    fprintf(stderr, "invitation at title: overlay=%d (invite=%d)\n", lui, LUI_INVITE);
+    shot("o2_invite");
+    overlay_layout();
+    tap(O.b6.x + O.b6.w / 2, O.b6.y + O.b6.h / 2); wait_frames(5);
+    fprintf(stderr, "after DECLINE: overlay=%d session=%d (idle=%d)\n", lui, sess, SS_IDLE);
+    pthread_mutex_lock(&pmu); sess = SS_PROMPT; sess_t = mono_ns(); pthread_mutex_unlock(&pmu);
+    wait_frames(10);
+    tap(O.b4.x + O.b4.w / 2, O.b4.y + O.b4.h / 2); wait_frames(5);
+    fprintf(stderr, "after ACCEPT: overlay=%d (search=%d) status='%s' kind=%d\n", lui, LUI_SEARCH, net_status_text(), net_kind());
+    shot("o3_linking");
+    net_stop(); lui = LUI_NONE; wait_frames(5);
+    /* the invitation runs out */
+    pthread_mutex_lock(&pmu); sess = SS_PROMPT; sess_t = mono_ns() - 19000000000LL; pthread_mutex_unlock(&pmu);
+    wait_frames(5);
+    pthread_mutex_lock(&pmu); sess = SS_IDLE; pthread_mutex_unlock(&pmu);   /* (the network thread would do this) */
+    wait_frames(5);
+    fprintf(stderr, "expired: overlay=%d msg='%s'\n", lui, lui_msg);
     destroy();
     return 0;
 }
