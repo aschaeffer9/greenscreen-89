@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <math.h>
 #include "gbcore.h"
 #include "touchui.h"
 #include "link.h"
@@ -106,7 +107,7 @@ static int hard_drop_hold;      /* frames to keep DOWN held after a hard drop */
 static int64_t hint_until;      /* controls hint shown for a while after launch */
 static Macro macro;             /* scripted presses from menu taps */
 /* 2-player link */
-enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM };
+enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM, LUI_CTL };
 static int lui;                 /* link overlay state */
 static char lui_msg[64];
 static int64_t linked_toast_until;
@@ -124,7 +125,7 @@ static int hard_drops;          /* stats / testing */
 typedef struct { int x, y, w, h; } Rc;
 static struct {
     int W, H, scale_num, scale_den;
-    Rc screen, bezel, bsel, bstart, hint, spk, wheel;
+    Rc screen, bezel, bsel, bstart, hint, spk, wheel, bctl;
     int landscape;
 } L;
 static int layout_gen;
@@ -133,6 +134,12 @@ static char server_host[128];   /* a custom MQTT broker pasted by the user ("" =
 /* sound: DMG-style volume wheel (0..10) and a mute switch */
 #define VOL_MAX 10
 static int vol_level = VOL_MAX, vol_muted;
+/* control feel, set in the CONTROLS panel: 1..10 (5 = default), flick 0 = hard drop off */
+#define SENS_MAX 10
+static int sens_touch = 5, sens_flick = 5;
+static float sens_factor(int v) { return powf(2.f, (5 - v) / 4.f); }   /* <1 = more sensitive */
+/* speed / load readout for the CONTROLS panel */
+static int64_t perf_t0, perf_work_ns; static int perf_frames, perf_loops; static float perf_speed = 100.f, perf_ms;
 static int64_t vol_shown_until;    /* show the level on screen for a moment after a change */
 static void save_settings(void);
 
@@ -161,6 +168,7 @@ static uint8_t held_from_pointers(void) {
 }
 
 static void overlay_tap(float x, float y);
+static void open_controls(void);
 static void unlink_session(const char *why);
 #define RESET_HOLD_NS 1200000000LL
 static void do_soft_reset(void);
@@ -201,6 +209,7 @@ static void ptr_down(int id, float x, float y, int64_t t) {
     else if (lui == LUI_NONE && in_btn(L.spk, x, y)) p->kind = 4;
     else if (in_btn(L.bsel, x, y)) p->kind = 1;
     else if (in_btn(L.bstart, x, y)) p->kind = 2;
+    else if (lui == LUI_NONE && rom_ready && L.bctl.w > 0 && in_btn(L.bctl, x, y)) p->kind = 5;
     else p->kind = 0;
     hist_add(p, x, y, t);
 }
@@ -226,13 +235,14 @@ static void ptr_move(int id, float x, float y, int64_t t) {
     if (!p || p->kind) return;
     if (lui != LUI_NONE) return;
     hist_add(p, x, y, t);
-    float step = dpi * 0.16f;               /* one column per ~4 mm of drag */
-    float drop = dpi * 0.22f;
+    float tf = sens_factor(sens_touch), ff = sens_factor(sens_flick);
+    float step = dpi * 0.16f * tf;          /* one column per ~4 mm of drag at the default setting */
+    float drop = dpi * 0.22f * tf;
     p->x = x; p->y = y;
     float dy = y - p->y0, dx = x - p->x0;
     int playing = in_game_unpaused();
     /* decide early whether this is a vertical gesture so a flick doesn't drift sideways */
-    if (!p->moved && !p->vertical && absf(dy) > dpi * 0.08f && absf(dy) > 2.f * absf(dx)) p->vertical = 1;
+    if (!p->moved && !p->vertical && absf(dy) > dpi * 0.08f * tf && absf(dy) > 2.f * absf(dx)) p->vertical = 1;
     float hstep = p->vertical ? step * 2.f : step;
     while (x - p->ax >= hstep) { queue_press(BTN_RIGHT); p->ax += hstep; p->moved = 1; }
     while (p->ax - x >= hstep) { queue_press(BTN_LEFT); p->ax -= hstep; p->moved = 1; }
@@ -245,7 +255,7 @@ static void ptr_move(int id, float x, float y, int64_t t) {
         p->dropping = 0;
         return;
     }
-    if (!p->t_cross && dy > dpi * 0.2f) p->t_cross = t;
+    if (!p->t_cross && dy > dpi * 0.2f * ff) p->t_cross = t;
     /* soft drop: finger pulled down and kept there (a quick flick is a hard drop instead) */
     if (!p->dropping && dy > drop && dy > 1.2f * absf(dx) && t - p->t0 > 140000000LL) { p->dropping = 1; p->was_dropping = 1; p->moved = 1; }
     if (p->dropping && dy < drop * 0.5f) p->dropping = 0;   /* slid back up: stop dropping */
@@ -277,6 +287,10 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
         if (!cancel && clean && p->kind == 1) queue_press(BTN_SELECT);
         if (!cancel && clean && p->kind == 2 && !p->reset_done) queue_press(BTN_START);
     }
+    if (!cancel && p->kind == 5) {
+        float mdx = x - p->x0, mdy = y - p->y0, slop = dpi * 0.12f;
+        if (mdx * mdx + mdy * mdy < slop * slop) open_controls();
+    }
     if (!cancel && p->kind == 4) {
         vol_muted = !vol_muted;
         if (!vol_muted && vol_level == 0) vol_level = 3;
@@ -294,6 +308,7 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
         float slop = dpi * 0.12f;
         int64_t dur = t - p->t0;
         int playing = in_game_unpaused();
+        float ff = 1.f;
         if (!p->moved && !p->vertical && dx * dx + dy * dy < slop * slop && dur < 400000000LL) {
             if (playing) {
                 /* tap: right half = A (rotate right), left half = B (rotate left) */
@@ -307,12 +322,12 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
                 macro.n = macro.pos = macro.phase = 0;
                 if (touchui_tap(&macro, gx, gy) == TOUCHUI_OPEN_LINK) { lui = LUI_MENU; lui_msg[0] = 0; }
             }
-        } else if (playing && !p->was_dropping
+        } else if (playing && !p->was_dropping && sens_flick > 0 && (ff = sens_factor(sens_flick)) > 0
                    && p->lock_at_down == lock_count                 /* still the same piece */
-                   && dy > dpi * 0.40f && dy > 2.0f * absf(dx)      /* a clear, straight pull */
-                   && p->t_cross && p->t_cross - p->t0 < 130000000LL /* fast right from the start */
-                   && dur < 260000000LL
-                   && recent_vy(p, t) > 5.0f) {                    /* still moving fast at release */
+                   && dy > dpi * 0.40f * ff && dy > 2.0f * absf(dx) /* a clear, straight pull */
+                   && p->t_cross && p->t_cross - p->t0 < (int64_t)(130000000.0f / ff) /* fast right from the start */
+                   && dur < (int64_t)(260000000.0f / ff)
+                   && recent_vy(p, t) > 5.0f * ff) {               /* still moving fast at release */
             hard_drop_req = 1;
         }
     }
@@ -369,6 +384,7 @@ static int handle_key(AInputEvent *ev) {
         if (action == AKEY_EVENT_ACTION_UP && lui == LUI_ROM) { ANativeActivity_finish(app.act); return 1; }
         if (action == AKEY_EVENT_ACTION_UP && lui != LUI_NONE) {
             if (lui == LUI_SEARCH) net_stop();
+            if (lui == LUI_CTL) save_settings();
             lui = lui == LUI_CPU ? LUI_MENU : LUI_NONE;
             return 1;
         }
@@ -579,7 +595,9 @@ static void compute_layout(int W, int H) {
         int by = L.bezel.y + L.bezel.h + (int)(64 * dp);   /* well clear of the play field */
         L.bsel = (Rc){cx + cw / 2 - gap / 2 - btn_w, by, btn_w, btn_h};
         L.bstart = (Rc){cx + cw / 2 + gap / 2, by, btn_w, btn_h};
-        L.hint = (Rc){cx, by + btn_h + (int)(22 * dp), cw, 0};
+        int ch_ = (int)(28 * dp), cwid = (int)(120 * dp);
+        L.bctl = (Rc){cx + (cw - cwid) / 2, by + btn_h + (int)(16 * dp), cwid, ch_};
+        L.hint = (Rc){cx, L.bctl.y + ch_ + (int)(18 * dp), cw, 0};
         /* mute button on the left of the row, DMG-style volume wheel on the right */
         int ww = (int)(btn_h * 0.55f), wh = (int)(btn_h * 1.5f);
         L.spk = (Rc){L.bsel.x - gap - btn_h, by, btn_h, btn_h};
@@ -594,6 +612,7 @@ static void compute_layout(int W, int H) {
         L.bsel = (Rc){cx + (lw - bw) / 2, by, bw, btn_h};
         L.bstart = (Rc){L.bezel.x + L.bezel.w + (rw - bw) / 2, by, bw, btn_h};
         L.hint = (Rc){0, 0, 0, 0};
+        L.bctl = (Rc){cx + (lw - bw) / 2, L.bezel.y, bw, (int)(28 * dp)};
         int ww = (int)(btn_h * 0.55f), wh = (int)(btn_h * 1.5f);
         L.spk = (Rc){cx + (lw - btn_h) / 2, by - (int)(16 * dp) - btn_h, btn_h, btn_h};
         L.wheel = (Rc){L.bezel.x + L.bezel.w + (rw - ww) / 2, by - (int)(16 * dp) - wh, ww, wh};
@@ -680,7 +699,8 @@ static void render(void) {
     int back_msg = back_time && t - back_time < 2000000000LL;
     int hint = hint_until > t;
     int ui_key = (!!(held & BTN_SELECT)) << 2 | (!!(held & BTN_START)) << 3 | hint << 4 | ((int)(start_prog * 20) << 5)
-               | (vol_level << 10) | (vol_muted << 14) | (any_ptr_kind(3) << 15) | (any_ptr_kind(4) << 16) | (layout_gen << 17);
+               | (vol_level << 10) | (vol_muted << 14) | (any_ptr_kind(3) << 15) | (any_ptr_kind(4) << 16) | (any_ptr_kind(5) << 17)
+               | (rom_ready << 18) | (layout_gen << 19);
     if (ui_key != last_ui_key) { full_redraws_left = 4; last_ui_key = ui_key; }
 
     ANativeWindow_Buffer buf;
@@ -725,6 +745,7 @@ static void render(void) {
         }
         draw_button(&c, L.bsel, "SELECT", held & BTN_SELECT, bts);
         draw_button(&c, L.bstart, "START", held & BTN_START, bts);
+        if (rom_ready && L.bctl.w > 0) draw_button(&c, L.bctl, "CONTROLS", any_ptr_kind(5), bts > 3 ? bts - 1 : bts);
         if (start_prog > 0) {
             Rc f = L.bstart; f.w = (int)(L.bstart.w * start_prog);
             Rc bar = { f.x + f.h / 4, f.y + f.h - f.h / 6 - 2, f.w - f.h / 2, f.h / 8 > 2 ? f.h / 8 : 2 };
@@ -907,16 +928,18 @@ static void save_settings(void) {
     if (!app.state_path[0] || import_mode) return;
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
     FILE *f = fopen(p, "w");
-    if (f) { fprintf(f, "vol %d\nmute %d\n", vol_level, vol_muted); fclose(f); }
+    if (f) { fprintf(f, "vol %d\nmute %d\ntouch %d\nflick %d\n", vol_level, vol_muted, sens_touch, sens_flick); fclose(f); }
 }
 static void load_settings(void) {
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
     FILE *f = fopen(p, "r");
     if (!f) return;
-    int v, m;
-    if (fscanf(f, "vol %d\nmute %d", &v, &m) == 2) {
-        if (v >= 0 && v <= VOL_MAX) vol_level = v;
-        vol_muted = m ? 1 : 0;
+    char key[16]; int v;
+    while (fscanf(f, "%15s %d", key, &v) == 2) {
+        if (!strcmp(key, "vol") && v >= 0 && v <= VOL_MAX) vol_level = v;
+        else if (!strcmp(key, "mute")) vol_muted = v ? 1 : 0;
+        else if (!strcmp(key, "touch") && v >= 1 && v <= SENS_MAX) sens_touch = v;
+        else if (!strcmp(key, "flick") && v >= 0 && v <= SENS_MAX) sens_flick = v;
     }
     fclose(f);
 }
@@ -1061,12 +1084,12 @@ static void sleep_until(int64_t due) {
     struct timespec ts = { (time_t)(w / 1000000000LL), (long)(w % 1000000000LL) };
     nanosleep(&ts, NULL);
 }
-/* VS CPU: both Game Boys advance slice by slice, like two real ones on a cable */
-#ifdef SIM_PROFILE
-static int64_t prof_bot_max, prof_bot_sum, prof_frame_max; static int prof_bot_n, prof_frames, prof_slow;
-static int64_t prof_hist[8];
-static void prof_bot(int64_t ns) { prof_bot_sum += ns; prof_bot_n++; if (ns > prof_bot_max) prof_bot_max = ns; int b = 0; while (b < 7 && ns > (250000LL << b)) b++; prof_hist[b]++; }
-#endif
+/* VS CPU: both Game Boys advance slice by slice, like two real ones on a cable.
+ * Nothing goes over a network, so there's no need to sleep between slices: run
+ * flat out until the player's Game Boy finishes a frame and let the sound
+ * output pace the loop, exactly like single-player. Only while the player's
+ * Game Boy is held waiting on the cable (menus) do we pace with the clock, so
+ * the bot's Game Boy doesn't race ahead. */
 static int run_vs_cpu_frame(void) {
     static int16_t tmp[4096 * 2];
     const unsigned slice_cyc = 70224 / 16;
@@ -1074,7 +1097,8 @@ static int run_vs_cpu_frame(void) {
     int frame_done = 0;
     int64_t t0 = now_ns();
     for (int s = 1; s < 48 && !frame_done; s++) {
-        loop_pump(now_ns());
+        int64_t t = now_ns();
+        loop_pump(t);
         /* the bot's Game Boy */
         if (!(b_gb_link_master_waiting() && b_tetris_link_hold_while_waiting())) {
             uint64_t target = b_gb_cycles() + slice_cyc;
@@ -1094,14 +1118,15 @@ static int run_vs_cpu_frame(void) {
         }
         loop_pump(now_ns());
         /* the player's Game Boy */
-        if (!(gb_link_master_waiting() && tetris_link_hold_while_waiting())) {
+        int held = gb_link_master_waiting() && tetris_link_hold_while_waiting();
+        if (!held) {
             uint64_t target = gb_cycles() + slice_cyc;
             for (int g = 0; g < 8 && gb_cycles() < target; g++) {
-                if (gb_link_master_waiting() && tetris_link_hold_while_waiting()) break;
+                if (gb_link_master_waiting() && tetris_link_hold_while_waiting()) { held = 1; break; }
                 if (gb_run_cycles((unsigned)(target - gb_cycles()))) { frame_done = 1; break; }
             }
         }
-        if (!frame_done) sleep_until(t0 + (int64_t)((double)s * (double)slice_ns * 0.96));
+        if (held && !frame_done) sleep_until(t0 + (int64_t)((double)s * (double)slice_ns));
     }
     loop_pump(now_ns());
     return frame_done;
@@ -1240,6 +1265,76 @@ static void draw_rom_panel(Canvas *c, Rc in, int cx, int bts) {
     if (rom_msg[0]) text_c(c, cx, O.b6.y + O.b6.h / 2, rom_msg, ms, C_TEXT);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* CONTROLS: touch / hard-drop sensitivity                             */
+/* ------------------------------------------------------------------ */
+static void open_controls(void) {
+    if (in_game_unpaused() && !linked) queue_press(BTN_START);   /* pause a solo game while adjusting */
+    lui = LUI_CTL;
+    full_redraws_left = 4;
+}
+/* a slider row: [-] bar [+]; returns the parts */
+static void slider_parts(Rc row, Rc *minus, Rc *bar, Rc *plus) {
+    int bw = row.h;
+    *minus = (Rc){ row.x, row.y, bw, row.h };
+    *plus = (Rc){ row.x + row.w - bw, row.y, bw, row.h };
+    *bar = (Rc){ row.x + bw + bw / 3, row.y + row.h / 3, row.w - 2 * bw - 2 * (bw / 3), row.h / 3 };
+}
+static int slider_tap(Rc row, float x, float y, int *v, int lo, int hi) {
+    Rc mi, bar, pl; slider_parts(row, &mi, &bar, &pl);
+    int old = *v;
+    if (in_rc(mi, x, y)) { if (*v > lo) (*v)--; }
+    else if (in_rc(pl, x, y)) { if (*v < hi) (*v)++; }
+    else if (y >= row.y && y < row.y + row.h && x >= bar.x - bar.h && x <= bar.x + bar.w + bar.h) {
+        float f = (x - bar.x) / (float)(bar.w > 1 ? bar.w : 1);
+        int nv = lo + (int)(f * (hi - lo) + 0.5f);
+        *v = nv < lo ? lo : nv > hi ? hi : nv;
+    }
+    return *v != old;
+}
+static void draw_slider(Canvas *c, Rc row, int v, int lo, int hi, int ts) {
+    Rc mi, bar, pl; slider_parts(row, &mi, &bar, &pl);
+    draw_button(c, mi, "-", 0, ts);
+    draw_button(c, pl, "+", 0, ts);
+    rrect(c, bar, bar.h / 2, C_BTN);
+    Rc on = bar; on.w = (int)((float)bar.w * (float)(v - lo) / (float)(hi - lo));
+    if (on.w > 0) rrect(c, on, bar.h / 2, C_TEXT);
+    int kx = bar.x + on.w, kr = bar.h;
+    Rc knob = { kx - kr, bar.y + bar.h / 2 - kr, 2 * kr, 2 * kr };
+    rrect(c, knob, kr, C_TEXT);
+}
+static void ctl_tap(float x, float y) {
+    int changed = 0;
+    changed |= slider_tap(O.b2, x, y, &sens_touch, 1, SENS_MAX);
+    changed |= slider_tap(O.b4, x, y, &sens_flick, 0, SENS_MAX);
+    Rc reset = O.b6, done = O.b6;
+    reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
+    if (in_rc(reset, x, y)) { sens_touch = 5; sens_flick = 5; changed = 1; }
+    else if (in_rc(done, x, y)) { save_settings(); lui = LUI_NONE; full_redraws_left = 4; return; }
+    if (changed) { save_settings(); full_redraws_left = 4; }
+}
+static void draw_ctl_panel(Canvas *c, Rc in, int cx, int bts) {
+    char l1[40], l2[40], l3[48];
+    snprintf(l1, sizeof l1, "SWIPE SENSITIVITY  %d", sens_touch);
+    if (sens_flick) snprintf(l2, sizeof l2, "HARD DROP FLICK  %d", sens_flick);
+    else snprintf(l2, sizeof l2, "HARD DROP FLICK  OFF");
+    snprintf(l3, sizeof l3, "SPEED %d%%  LOAD %.1f MS", (int)(perf_speed + 0.5f), perf_ms);
+    int ms = bts;
+    const char *w[] = { l1, l2, l3, "HIGHER = LESS MOVEMENT NEEDED" };
+    for (int i = 0; i < 4; i++) while (ms > 1 && text_w(w[i], ms) > in.w - 16) ms--;
+    text_c(c, cx, O.b1.y + O.b1.h / 2 - 3 * ms, l1, ms, C_TEXT);
+    draw_slider(c, O.b2, sens_touch, 1, SENS_MAX, bts);
+    text_c(c, cx, O.b3.y + O.b3.h / 2 - 3 * ms, l2, ms, C_TEXT);
+    draw_slider(c, O.b4, sens_flick, 0, SENS_MAX, bts);
+    text_c(c, cx, O.b5.y + 1 * ms, "HIGHER = LESS MOVEMENT NEEDED", ms, C_DIM);
+    text_c(c, cx, O.b5.y + 11 * ms, l3, ms, C_DIM);
+    Rc reset = O.b6, done = O.b6;
+    reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
+    draw_button(c, reset, "RESET", 0, bts);
+    draw_button(c, done, "DONE", 0, bts);
+}
+
 static void overlay_layout(void) {
     Rc r = L.screen;
     int m = r.w / 12;
@@ -1256,6 +1351,7 @@ static void overlay_layout(void) {
 static void overlay_tap(float x, float y) {
     overlay_layout();
     if (lui == LUI_ROM) { rom_tap(x, y); return; }
+    if (lui == LUI_CTL) { ctl_tap(x, y); return; }
     if (lui == LUI_MENU) {
         if (in_rc(O.b1, x, y)) lui = LUI_CPU;
         else if (in_rc(O.b2, x, y)) { net_start_lan(); lui = LUI_SEARCH; }
@@ -1293,13 +1389,14 @@ static void draw_overlay(Canvas *c, int tsc) {
     rrect(c, O.panel, O.panel.w / 16, C_BEZEL);
     Rc in = { O.panel.x + 3, O.panel.y + 3, O.panel.w - 6, O.panel.h - 6 };
     rrect(c, in, O.panel.w / 16, C_BG);
-    const char *title = lui == LUI_ROM ? "YOUR TETRIS ROM" : "2 PLAYER LINK";
+    const char *title = lui == LUI_ROM ? "YOUR TETRIS ROM" : lui == LUI_CTL ? "CONTROLS" : "2 PLAYER LINK";
     int ts = tsc;
     while (ts > 1 && text_w(title, ts) > in.w - 20) ts--;
     int cx = O.panel.x + O.panel.w / 2;
     text_c(c, cx, O.panel.y + O.panel.h / 14, title, ts, C_TEXT);
     int bts = ts > 4 ? 4 : ts;
     if (lui == LUI_ROM) { draw_rom_panel(c, in, cx, bts); return; }
+    if (lui == LUI_CTL) { draw_ctl_panel(c, in, cx, bts); return; }
     if (lui == LUI_MENU) {
         draw_button(c, O.b1, "VS CPU", 0, bts);
         draw_button(c, O.b2, "SAME WI-FI", 0, bts);
@@ -1442,6 +1539,7 @@ static void *game_thread(void *arg) {
         /* new buttons only once the Game Boy has finished the previous frame,
          * so a one-frame tap is never lost while the link holds the game */
         static int need_buttons = 1;
+        struct timespec cpu0, cpu1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
         if (need_buttons) gb_set_buttons(frame_buttons());
         if (linked) need_buttons = run_linked_frame(); else { gb_run_frame(); need_buttons = 1; }
         {
@@ -1451,6 +1549,20 @@ static void *game_thread(void *arg) {
             prev_fall = fall;
         }
         render();
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+        {   /* SPEED / LOAD readout: emulated frames per real second, and CPU time per loop */
+            int64_t t = now_ns();
+            perf_work_ns += (int64_t)(cpu1.tv_sec - cpu0.tv_sec) * 1000000000LL + (cpu1.tv_nsec - cpu0.tv_nsec);
+            perf_loops++;
+            if (need_buttons) perf_frames++;
+            if (!perf_t0) perf_t0 = t;
+            if (t - perf_t0 > 1000000000LL) {
+                perf_speed = (float)perf_frames / ((float)(t - perf_t0) / 1e9f) / 59.7275f * 100.f;
+                perf_ms = (float)perf_work_ns / 1e6f / (float)(perf_loops ? perf_loops : 1);
+                perf_t0 = t; perf_frames = 0; perf_loops = 0; perf_work_ns = 0;
+                if (lui == LUI_CTL) full_redraws_left = 2;
+            }
+        }
         audio_push_and_pace();
 
         pthread_mutex_lock(&app.mu);

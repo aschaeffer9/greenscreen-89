@@ -8,8 +8,8 @@ rm -rf build/arm64 build/apk; mkdir -p build/arm64 build/apk/lib/arm64-v8a
 # No game code or data goes into the app: the player loads their own ROM on first run.
 # The CPU core is a generic Game Boy instruction interpreter generated without any ROM.
 python3 gen.py --interp core/cpu_interp.c
-CF="-DGB_INTERP_ONLY --target=aarch64-linux-android28 --sysroot=$SYSROOT -fPIC -O2 -fvisibility=hidden -mno-outline-atomics -fno-stack-protector -Icore -Iandroid"
-for f in android/main.c android/touchui.c android/link.c android/net.c android/cpubot.c android/rom.c core/gbcore.c core/tetris_extras.c core/cpu_interp.c; do
+CF="${EXTRA_CFLAGS:-} -DGB_INTERP_ONLY --target=aarch64-linux-android28 --sysroot=$SYSROOT -fPIC -O2 -fvisibility=hidden -mno-outline-atomics -fno-stack-protector -Icore -Iandroid"
+for f in android/main.c android/touchui.c android/link.c android/net.c android/cpubot.c android/rom.c core/gbcore.c core/tetris_extras.c core/cpu_interp.c ${EXTRA_SRC:-}; do
   clang $CF -Wall -Wno-unused-function -c "$f" -o "build/arm64/$(basename "$f" .c).o"
 done
 
@@ -38,11 +38,11 @@ ld.lld -shared -soname libgreenscreen.so --no-undefined -z now -z relro -z noexe
   build/arm64/*.o -Lbuild/stubs -lc -landroid -laaudio -llog
 
 python3 android/mkapk.py build/apk/lib/arm64-v8a/libgreenscreen.so android/icon.png build/gs-unsigned.apk
-KS="${KEYSTORE:-build/greenscreen.keystore}"; KP="${KEYSTORE_PASS:-greenscreen89}"
+KS="${KEYSTORE:-build/greenscreen.keystore}"; KP="${KEYSTORE_PASS:-greenscreen89}"; KA="${KEY_ALIAS:-greenscreen}"
 [ -f "$KS" ] || keytool -genkeypair -keystore "$KS" -storepass "$KP" \
-  -keypass "$KP" -alias greenscreen -keyalg RSA -keysize 2048 -validity 20000 -dname "CN=Greenscreen 89 Personal Build"
+  -keypass "$KP" -alias "$KA" -keyalg RSA -keysize 2048 -validity 20000 -dname "CN=Greenscreen 89 Personal Build"
 cp build/gs-unsigned.apk build/gs-signed.apk
 jarsigner -keystore "$KS" -storepass "$KP" -sigalg SHA256withRSA -digestalg SHA-256 \
-  build/gs-signed.apk greenscreen >/dev/null
+  build/gs-signed.apk "$KA" >/dev/null
 python3 android/zipalign.py build/gs-signed.apk build/Greenscreen89.apk
 jarsigner -verify build/Greenscreen89.apk | grep -q "jar verified" && echo "APK OK: build/Greenscreen89.apk"

@@ -22,6 +22,27 @@ Unofficial fan project, personal and non-commercial. Not affiliated with The Tet
 | Tap menu items | Choose; Back = B |
 | Hold START | Soft reset |
 
+**CONTROLS** (under the START button) opens two sliders:
+
+- **Swipe sensitivity** (1–10): how far you drag per column and before soft drop starts. Higher means less movement.
+- **Hard drop flick** (0–10): how short and slow a flick can be and still hard-drop. 0 turns hard drop off.
+
+The panel also shows game speed and CPU load per frame, which is handy for checking performance on slower phones.
+
+Keyboards and controllers work too (good for DeX):
+
+| Key | Action |
+| --- | --- |
+| Arrows / WASD | Move, soft drop |
+| Up, W or Space (in game) | Hard drop |
+| X, K | A |
+| Z, J | B |
+| Enter | START |
+| Shift, Tab | SELECT |
+| Esc | Back |
+
+On controllers, R1 is hard drop.
+
 2PLAYER on the title screen opens the link menu:
 
 - **VS CPU**: Easy, Normal or Hard bot. It runs on a second emulated Game Boy that the bot plays through its buttons.
@@ -50,6 +71,8 @@ SYSROOT=/path/to/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot ./build.sh
 ```
 
 `build.sh` generates a generic Game Boy CPU interpreter (`gen.py --interp`, which needs no ROM), compiles the arm64 library, builds a second renamed copy of the core for the CPU opponent, writes the manifest and resources by hand (`android/mkapk.py`), then signs and aligns the APK.
+
+To use your own relay instead of the public brokers, build with `EXTRA_CFLAGS='-DT89_WS_RELAY="your-relay.example.workers.dev"'` and deploy the Worker in `legacy/cloudflare-relay`.
 
 The signing key is created at `build/greenscreen.keystore` on the first build (or pass `KEYSTORE=` and `KEYSTORE_PASS=`). **Keep a backup.** Android only installs updates signed with the same key. Override the app ID with `PACKAGE=com.example.something ./build.sh`.
 

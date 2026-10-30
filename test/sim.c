@@ -103,8 +103,22 @@ aaudio_result_t AAudioStream_write(AAudioStream *s, const void *buf, int32_t n, 
     if (audio_out) fwrite(buf, 4, (size_t)n, audio_out);
     audio_frames += n;
     /* simulate the device consuming at 48 kHz, 8x faster than real time */
-    struct timespec ts = { 0, (long)((int64_t)n * 1000000000LL / 48000 / 8) };
-    if (!getenv("SIM_NO_AUDIO_SLEEP")) nanosleep(&ts, NULL);
+    if (getenv("SIM_AUDIO_REALTIME")) {
+        /* like AAudio: a buffer drained at 48 kHz; write blocks only while it's full */
+        static int64_t written, t_start;
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t tn = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+        if (!t_start) t_start = tn;
+        written += n;
+        int64_t played = (tn - t_start) * 48000 / 1000000000LL;
+        if (played > written) { t_start = tn - written * 1000000000LL / 48000; played = written; }   /* underrun */
+        int64_t over = (written - played) - 2048;          /* ~43 ms of buffer */
+        if (over > 0) { struct timespec ts = { 0, (long)(over * 1000000000LL / 48000) }; nanosleep(&ts, NULL); }
+    } else {
+        /* the device consumes at 48 kHz, 8x faster than real time (fast tests) */
+        struct timespec ts = { 0, (long)((int64_t)n * 1000000000LL / 48000 / 8) };
+        if (!getenv("SIM_NO_AUDIO_SLEEP")) nanosleep(&ts, NULL);
+    }
     return n;
 }
 
@@ -188,6 +202,7 @@ static void destroy(void) {
 static int run_2p(char role, int listen, int send);
 static int run_cpu(int level, int rounds);
 static int run_norom(void);
+static int run_ctl(void);
 /* the tester's own ROM: T89_ROM=/path/to/rom.gb */
 static const char *rom_src(void) { return getenv("T89_ROM") ? getenv("T89_ROM") : "rom/Tetris (World) (Rev A).gb"; }
 static void install_rom(void) {
@@ -198,6 +213,7 @@ static void install_rom(void) {
 int main(int argc, char **argv) {
     outdir = argv[1];
     if (argc > 2 && !strcmp(argv[2], "norom")) return run_norom();
+    if (argc > 2 && !strcmp(argv[2], "ctl")) { install_rom(); return run_ctl(); }
     install_rom();
     if (argc > 6) return run_2p(argv[4][0], atoi(argv[5]), atoi(argv[6]));
     if (argc > 2 && !strcmp(argv[2], "cpu")) return run_cpu(argc > 3 ? atoi(argv[3]) : 2, argc > 4 ? atoi(argv[4]) : 2);
@@ -414,6 +430,7 @@ static int run_cpu(int level, int rounds) {
     { struct timespec a, b; uint64_t c0 = gb_cycles(); clock_gettime(CLOCK_MONOTONIC, &a); wait_frames(300); clock_gettime(CLOCK_MONOTONIC, &b);
       double secs = (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9;
       fprintf(stderr, "unlinked pace: %.1f fps\n", (double)(gb_cycles() - c0) / 70224.0 / secs); }
+    fprintf(stderr, "single-player readout: speed %.0f%%, load %.2f ms of CPU per frame\n", perf_speed, perf_ms);
     tap_gb(120, 115); wait_frames(10);
     fprintf(stderr, "overlay %d (menu=%d)\n", lui, LUI_MENU);
     shot("cpu_menu");
@@ -467,6 +484,7 @@ static int run_cpu(int level, int rounds) {
         double secs = (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9;
         fprintf(stderr, "  round lasted %.1fs wall, %d player frames (%.1f fps); lines left you=%02x bot=%02x; states %02x/%02x\n",
                 secs, frames, frames / secs, gb_peek(0xFF9E), b_gb_peek(0xFF9E), gs_(), cpu_b_state());
+        fprintf(stderr, "  readout: speed %.0f%%, load %.2f ms of CPU per frame\n", perf_speed, perf_ms);
         shot(rd == 0 ? "cpu_round1_end" : "cpu_roundN_end");
         /* continue: press START at the results until back at heights */
         for (int j = 0; j < 40 && !(gs_() == 0x17 || gs_() == 0x1a); j++) { wait_frames(60); tap(L.bstart.x + L.bstart.w / 2, L.bstart.y + L.bstart.h / 2); }
@@ -534,6 +552,62 @@ static int run_norom(void) {
     { uint8_t r[ROM_SIZE]; rom_check_file(rom_src(), r); rom_save(p, r); }
     wait_frames(60);
     fprintf(stderr, "picked up import from elsewhere: rom_ready=%d\n", rom_ready);
+    destroy();
+    return 0;
+}
+
+/* ---------------- CONTROLS panel: sensitivity sliders ---------------- */
+static int piece_x(void) { return gb_peek(0xC202); }
+static int cols_for_drag(float inches) {
+    float cx = L.screen.x + L.screen.w * 0.3f, cy = L.screen.y + L.screen.h * 0.3f;
+    int x0 = piece_x();
+    drag(cx, cy, cx + dpi * inches, cy, 10, 2); wait_frames(6);
+    int d = (piece_x() - x0) / 8;
+    drag(cx + dpi * inches, cy, cx, cy, 10, 2); wait_frames(6);   /* back again */
+    return d;
+}
+static void ctl_tap_rc(Rc r) { tap(r.x + r.w / 2, r.y + r.h / 2); wait_frames(3); }
+static void set_slider(Rc row, int *v, int target) {
+    Rc mi, bar, pl; slider_parts(row, &mi, &bar, &pl);
+    for (int k = 0; k < 12 && *v != target; k++) ctl_tap_rc(*v > target ? mi : pl);
+}
+static int run_ctl(void) {
+    char sp[512]; snprintf(sp, sizeof sp, "%s/tetris_state.bin", outdir); remove(sp);
+    char setp[600]; snprintf(setp, sizeof setp, "%s/tetris_state.bin.settings", outdir); remove(setp);
+    win.copyback = 1;
+    create(1080, 2340);
+    wait_frames(330);
+    for (int i = 0; i < 5 && gb_peek(0xFFE1) != 0x00; i++) { key(AKEYCODE_ENTER); wait_frames(40); }
+    fprintf(stderr, "in game: state %02x\n", gb_peek(0xFFE1));
+    int res[3], levels[3] = { 1, 5, 10 };
+    for (int i = 0; i < 3; i++) {
+        tap(L.bctl.x + L.bctl.w / 2, L.bctl.y + L.bctl.h / 2); wait_frames(5);
+        if (i == 0) { fprintf(stderr, "panel open: %d (ctl=%d), game paused: %d\n", lui, LUI_CTL, gb_peek(0xFFAB)); shot("ctl_panel"); }
+        overlay_layout();
+        set_slider(O.b2, &sens_touch, levels[i]);
+        Rc done = O.b6; done.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - done.w;
+        ctl_tap_rc(done);
+        if (gb_peek(0xFFAB)) { key(AKEYCODE_ENTER); wait_frames(20); }   /* unpause */
+        res[i] = cols_for_drag(0.34f);
+        fprintf(stderr, "swipe sensitivity %d: a 0.34 in drag moved %d columns\n", sens_touch, res[i]);
+    }
+    /* hard drop flick: off / default / max */
+    int fl[3] = { 0, 5, 10 }; float dist[3] = { 0.6f, 0.6f, 0.25f };
+    for (int i = 0; i < 3; i++) {
+        tap(L.bctl.x + L.bctl.w / 2, L.bctl.y + L.bctl.h / 2); wait_frames(5);
+        overlay_layout();
+        set_slider(O.b4, &sens_flick, fl[i]);
+        if (i == 0) shot("ctl_flick_off");
+        Rc done = O.b6; done.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - done.w;
+        ctl_tap_rc(done);
+        if (gb_peek(0xFFAB)) { key(AKEYCODE_ENTER); wait_frames(20); }
+        int hd = hard_drops;
+        flick(L.screen.x + L.screen.w * 0.5f, L.screen.y + L.screen.h * 0.3f, dpi * dist[i]); wait_frames(5);
+        fprintf(stderr, "flick setting %d, %.2f in flick: hard drop %s\n", sens_flick, dist[i], hard_drops > hd ? "YES" : "no");
+    }
+    destroy();
+    create(1080, 2340); wait_frames(10);
+    fprintf(stderr, "after relaunch: swipe %d flick %d (want 10 10)\n", sens_touch, sens_flick);
     destroy();
     return 0;
 }

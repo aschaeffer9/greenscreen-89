@@ -139,6 +139,9 @@ def build_arsc(package_name, icon_path):
 # its own app ID, so it installs alongside earlier personal builds
 import os
 PACKAGE = os.environ.get('PACKAGE', 'com.ari.greenscreen89')
+LABEL = os.environ.get('LABEL', "Greenscreen '89")
+VERSION_CODE = int(os.environ.get('VERSION_CODE', '14'))
+VERSION_NAME = os.environ.get('VERSION_NAME', '3.3')
 
 
 def main():
@@ -146,20 +149,20 @@ def main():
     A = lambda n, t, v: (True, n, t, v)
     manifest = Elem('manifest', [
         (False, 'package', T_STRING, PACKAGE),
-        A('versionCode', T_INT_DEC, 13), A('versionName', T_STRING, '3.2'),
+        A('versionCode', T_INT_DEC, VERSION_CODE), A('versionName', T_STRING, VERSION_NAME),
     ], [
         Elem('uses-sdk', [A('minSdkVersion', T_INT_DEC, 28), A('targetSdkVersion', T_INT_DEC, 28)]),
         Elem('uses-permission', [A('name', T_STRING, 'android.permission.INTERNET')]),
         # only used to look for the player's own ROM in Downloads on first run
         Elem('uses-permission', [A('name', T_STRING, 'android.permission.READ_EXTERNAL_STORAGE')]),
         Elem('application', [
-            A('label', T_STRING, "Greenscreen '89"), A('icon', T_REF, 0x7f010000),
+            A('label', T_STRING, LABEL), A('icon', T_REF, 0x7f010000),
             A('hasCode', T_BOOL, 0), A('allowBackup', T_BOOL, 0), A('isGame', T_BOOL, 0xFFFFFFFF),
             A('extractNativeLibs', T_BOOL, 0xFFFFFFFF),
         ], [
             Elem('activity', [
                 A('name', T_STRING, 'android.app.NativeActivity'),
-                A('label', T_STRING, "Greenscreen '89"),
+                A('label', T_STRING, LABEL),
                 A('theme', T_REF, THEME_BLACK_NOTITLEBAR_FULLSCREEN),
                 A('screenOrientation', T_INT_DEC, 2),           # "user"
                 A('configChanges', T_INT_HEX, 0x40007FFF),

@@ -461,6 +461,114 @@ static void become_paired(const char *peer, const char *cl) {
     set_status(NET_CONNECTED, "LINKED ONLINE");
 }
 
+
+#ifdef T89_WS_RELAY
+/* ---- optional: a self-hosted relay instead of the public brokers ----
+ * Build with -DT89_WS_RELAY='"relay.example.workers.dev"' to use the
+ * Cloudflare Worker in legacy/cloudflare-relay (WebSocket over TLS; the relay
+ * pairs two players in a room and forwards their packets). */
+#define WS_PATH "/link?room=public"
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void b64(const uint8_t *in, int n, char *out) {
+    int k = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < n ? (uint32_t)in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+        out[k++] = B64[(v >> 18) & 63]; out[k++] = B64[(v >> 12) & 63];
+        out[k++] = i + 1 < n ? B64[(v >> 6) & 63] : '=';
+        out[k++] = i + 2 < n ? B64[v & 63] : '=';
+    }
+    out[k] = 0;
+}
+/* client frames are masked (RFC 6455) */
+static int ws_send_frame(JNIEnv *e, int opcode, const uint8_t *p, int n) {
+    uint8_t buf[300];
+    if (n > 250) return -1;
+    int k = 0;
+    buf[k++] = (uint8_t)(0x80 | opcode);
+    buf[k++] = (uint8_t)(0x80 | n);
+    uint8_t m[4]; put32(m, rand32());
+    memcpy(buf + k, m, 4); k += 4;
+    for (int i = 0; i < n; i++) buf[k + i] = p[i] ^ m[i & 3];
+    return ws_write_raw(e, buf, k + n);
+}
+static int ws_need(JNIEnv *e, int n) {
+    while (rlen < n) {
+        if (ws_stop) return -1;
+        int g = ws_read(e, rbuf + rlen, (int)sizeof rbuf - rlen);
+        if (g < 0) return -1;
+        rlen += g;
+    }
+    return 0;
+}
+static void *ws_relay_thread(void *arg) {
+    (void)arg;
+    JNIEnv *e = NULL;
+    if ((*jvm)->AttachCurrentThread(jvm, &e, NULL) != JNI_OK || !e) { set_status(NET_FAILED, "INTERNAL ERROR"); ws_running = 0; return NULL; }
+    set_status(NET_SEARCHING, "CONNECTING...");
+    const char *host = ws_host[0] ? ws_host : T89_WS_RELAY;
+    int port = ws_host[0] ? ws_port : 443;
+    if (tls_open(e, host, port) != 0) { if (!ws_stop) set_status(NET_FAILED, "CAN'T REACH SERVER"); goto done; }
+    {
+        uint8_t key[16]; for (int i = 0; i < 16; i += 4) put32(key + i, rand32());
+        char k64[32]; b64(key, 16, k64);
+        char req[512], hosthdr[160];
+        if (port == 443) snprintf(hosthdr, sizeof hosthdr, "%s", host);
+        else snprintf(hosthdr, sizeof hosthdr, "%s:%d", host, port);
+        int n = snprintf(req, sizeof req,
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nUser-Agent: Tetris89/2\r\n\r\n", WS_PATH, hosthdr, k64);
+        if (ws_write_raw(e, (const uint8_t *)req, n) < 0) { set_status(NET_FAILED, "CONNECTION FAILED"); goto done_sock; }
+        int hdr_end = -1;
+        int64_t t0 = mono_ns();
+        while (hdr_end < 0) {
+            if (ws_stop || mono_ns() - t0 > 10000000000LL) { set_status(NET_FAILED, "SERVER DIDN'T ANSWER"); goto done_sock; }
+            int g = ws_read(e, rbuf + rlen, (int)sizeof rbuf - rlen - 1);
+            if (g < 0) { set_status(NET_FAILED, "CONNECTION FAILED"); goto done_sock; }
+            rlen += g; rbuf[rlen] = 0;
+            char *q = strstr((char *)rbuf, "\r\n\r\n");
+            if (q) hdr_end = (int)(q - (char *)rbuf) + 4;
+            if (rlen >= (int)sizeof rbuf - 1) break;
+        }
+        if (hdr_end < 0 || strncmp((char *)rbuf, "HTTP/1.1 101", 12) != 0) { set_status(NET_FAILED, "SERVER REFUSED"); goto done_sock; }
+        consume(hdr_end);
+    }
+    set_status(NET_SEARCHING, "WAITING FOR A PLAYER...");
+    while (!ws_stop) {
+        if (ws_need(e, 2) < 0) break;
+        int op = rbuf[0] & 15, masked = rbuf[1] & 0x80;
+        uint64_t len = rbuf[1] & 127; int h = 2;
+        if (len == 126) { if (ws_need(e, 4) < 0) break; len = (uint64_t)rbuf[2] << 8 | rbuf[3]; h = 4; }
+        else if (len == 127) { if (ws_need(e, 10) < 0) break; len = 0; for (int i = 0; i < 8; i++) len = len << 8 | rbuf[2 + i]; h = 10; }
+        if (masked) h += 4;
+        if (len > 2048) break;
+        if (ws_need(e, h + (int)len) < 0) break;
+        uint8_t *pl = rbuf + h;
+        if (masked) for (uint64_t i = 0; i < len; i++) pl[i] ^= rbuf[h - 4 + (i & 3)];
+        if (op == 2) {
+            if (len >= 5 && memcmp(pl, MAGIC, 4) == 0 && pl[4] == 'D') rx_push(pl + 5, (int)len - 5);
+        } else if (op == 1) {
+            char t[64]; int m = len < 63 ? (int)len : 63; memcpy(t, pl, (size_t)m); t[m] = 0;
+            if (!strcmp(t, "paired")) { __atomic_store_n(&paired, 1, __ATOMIC_RELEASE); set_status(NET_CONNECTED, "LINKED ONLINE"); }
+            else if (!strcmp(t, "wait")) set_status(NET_SEARCHING, "WAITING FOR A PLAYER...");
+            else if (!strcmp(t, "left")) { set_status(NET_FAILED, "OTHER PLAYER LEFT"); consume(h + (int)len); break; }
+        } else if (op == 9) {
+            ws_send_frame(e, 10, pl, (int)len);
+        } else if (op == 8) {
+            set_status(NET_FAILED, "SERVER CLOSED"); consume(h + (int)len); break;
+        }
+        consume(h + (int)len);
+    }
+    if (net_state() != NET_FAILED && !ws_stop) set_status(NET_FAILED, "CONNECTION LOST");
+done_sock:
+    close_sock(e);
+done:
+    (*jvm)->DetachCurrentThread(jvm);
+    ws_running = 0;
+    if (wake_pipe[1] >= 0) { char b = 1; if (write(wake_pipe[1], &b, 1) < 0) {} }
+    return NULL;
+}
+#endif
+
 static void *ws_thread(void *arg) {
     (void)arg;
     JNIEnv *e = NULL;
@@ -584,7 +692,11 @@ int net_start_online(JavaVM *vm, const char *host) {
     uint32_t a = rand32(), b = rand32();
     snprintf(my_hex, sizeof my_hex, "%08x%08x", a, b);
     paired = 0; direct_ok = 0; ncands = 0; peer_hex[0] = 0;
+#ifdef T89_WS_RELAY
+    o_fd = -1;                      /* the relay carries everything: no direct path */
+#else
     o_fd = socket(AF_INET, SOCK_DGRAM, 0);
+#endif
     if (o_fd >= 0) {
         struct sockaddr_in me; memset(&me, 0, sizeof me);
         me.sin_family = AF_INET; me.sin_addr.s_addr = htonl(INADDR_ANY); me.sin_port = 0;
@@ -594,7 +706,12 @@ int net_start_online(JavaVM *vm, const char *host) {
     rx_h = rx_t = 0; ws_stop = 0; ws_running = 1;
     kind = NET_KIND_ONLINE;
     set_status(NET_SEARCHING, "CONNECTING...");
-    if (pthread_create(&ws_th, NULL, ws_thread, NULL) != 0) { ws_running = 0; set_status(NET_FAILED, "INTERNAL ERROR"); return -1; }
+#ifdef T89_WS_RELAY
+    void *(*thread_fn)(void *) = ws_relay_thread;
+#else
+    void *(*thread_fn)(void *) = ws_thread;
+#endif
+    if (pthread_create(&ws_th, NULL, thread_fn, NULL) != 0) { ws_running = 0; set_status(NET_FAILED, "INTERNAL ERROR"); return -1; }
     return 0;
 }
 void net_test_plain_brokers(int on) { test_mode_plain = on; }
@@ -945,7 +1062,9 @@ void net_stop(void) {
     if (ufd >= 0) { close(ufd); ufd = -1; }
     if (kind == NET_KIND_ONLINE) {
         /* tell the other player right away (the link layer's BYE may not get through the broker in time) */
+#ifndef T89_WS_RELAY
         if (paired && j_out) { JNIEnv *e = genv(); char m[40]; snprintf(m, sizeof m, "N %s", my_hex); if (e) mq_publish_text(e, t_peer, m); }
+#endif
         ws_stop = 1;
         /* closing the socket unblocks the reader */
         if (j_sock && genv()) {
@@ -983,9 +1102,13 @@ void net_send(const uint8_t *p, int n) {
             sendto(ufd, m, (size_t)n + 5, 0, (struct sockaddr *)&peer_addr, sizeof peer_addr);
     } else if (kind == NET_KIND_ONLINE) {
         if (!paired || net_state() != NET_CONNECTED) return;
-        if (direct_ok) { online_udp_send(&direct_addr, 'D', p, n); return; }
         JNIEnv *e = genv();
+#ifdef T89_WS_RELAY
+        if (e) ws_send_frame(e, 2, m, n + 5);
+#else
+        if (direct_ok) { online_udp_send(&direct_addr, 'D', p, n); return; }
         if (e) mq_publish(e, t_peer, m, n + 5);
+#endif
     } else if (kind == NET_KIND_USB) {
         if (net_state() == NET_CONNECTED) usb_write(m, n + 5);
     }

@@ -28,7 +28,11 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(role, "badhost")) { net_stop(); printf("[%s] done\n", role); return 0; }
     if (net_state() != NET_CONNECTED) { printf("[%s] FAIL not connected\n", role); return 2; }
-    { int64_t tw = now(); while (now() - tw < 1500000000LL) { uint8_t b[64]; net_poll(now()); while (net_recv(b, sizeof b) > 0) {} net_wait(5000000); } }
+    /* settle for 1.5 s (lets the direct path form); keep anything the other side already sent */
+    static uint8_t early[400][64]; static int early_len[400], nearly = 0, eat = 0;
+    { int64_t tw = now(); while (now() - tw < 1500000000LL) { uint8_t b[64]; int n; net_poll(now());
+        while ((n = net_recv(b, sizeof b)) > 0) if (nearly < 400) { memcpy(early[nearly], b, (size_t)n); early_len[nearly++] = n; }
+        net_wait(5000000); } }
     printf("[%s] path after 1.5s: %s\n", role, net_online_direct() ? "DIRECT P2P" : "BROKER RELAY");
     /* exchange 300 numbered packets each way */
     int sent = 0, got = 0, bad = 0, expect = 0;
@@ -40,7 +44,7 @@ int main(int argc, char **argv) {
             net_send(p, 12); sent++;
         }
         uint8_t b[64]; int n;
-        while ((n = net_recv(b, sizeof b)) > 0) {
+        while ((eat < nearly && (n = early_len[eat], memcpy(b, early[eat], (size_t)n), eat++, 1)) || (n = net_recv(b, sizeof b)) > 0) {
             int k = b[1] | b[2] << 8;
             if (n != 12 || k != expect || b[3] == (uint8_t)role[0]) bad++;
             for (int i = 7; i < 12 && n == 12; i++) if (b[i] != (uint8_t)(k * 7 + i)) bad++;
