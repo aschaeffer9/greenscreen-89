@@ -120,6 +120,15 @@ int32_t ANativeWindow_lock(ANativeWindow *window, ANativeWindow_Buffer *out, ARe
 
 int32_t ANativeWindow_unlockAndPost(ANativeWindow *window) {
     if (!window) return -1;
+        {   /* fps probe: log every 120 presented frames */
+        static int64_t t0; static int n;
+        int64_t t = now_ns();
+        if (!t0) t0 = t;
+        if (++n >= 120) {
+            ios_log("render fps %.1f (%d frames / %.2fs)", n * 1e9 / (double)(t - t0), n, (t - t0) / 1e9);
+            t0 = t; n = 0;
+        }
+    }
     {   /* one line of geometry so the layout can be checked from CI logs */
         static int logged;
         if (!logged) { logged = 1; ios_log("first frame %dx%d stride %d", window->w, window->h, window->w); }
