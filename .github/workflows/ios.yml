@@ -70,6 +70,10 @@ jobs:
           ./ios/build_ios.sh
 
       - name: Boot, install, launch, screenshot
+        env:
+          # optional: base64 of your own Tetris (World) (Rev A) dump.
+          # Never committed. Delete the secret and this step just skips it.
+          T89_ROM_B64: ${{ secrets.T89_ROM_B64 }}
         run: |
           set -euo pipefail
           APP="build/ios-sim/Payload/Greenscreen89.app"
@@ -78,10 +82,21 @@ jobs:
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl install "$UDID" "$APP"
+          if [ -n "${T89_ROM_B64:-}" ]; then
+            CONTAINER="$(xcrun simctl get_app_container "$UDID" com.example.greenscreen89 data)"
+            printf '%s' "$T89_ROM_B64" | base64 --decode > "$CONTAINER/Documents/rom.gb" 2>/dev/null \
+              || printf '%s' "$T89_ROM_B64" | base64 -D > "$CONTAINER/Documents/rom.gb"
+            echo "ROM placed in the app container ($(wc -c < "$CONTAINER/Documents/rom.gb") bytes)"
+          else
+            echo "no T89_ROM_B64 secret set: the app will show the ROM screen"
+          fi
           xcrun simctl launch "$UDID" com.example.greenscreen89 || true
           sleep 12
           mkdir -p build/shots
           xcrun simctl io "$UDID" screenshot build/shots/launch.png
+          # a second frame: if the two differ, the emulator is actually running
+          sleep 15
+          xcrun simctl io "$UDID" screenshot build/shots/launch2.png
           xcrun simctl spawn "$UDID" log show --last 2m --style compact \
             --predicate 'process == "Greenscreen89"' > build/shots/app.log || true
           echo "--- last lines ---"
