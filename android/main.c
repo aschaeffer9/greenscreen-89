@@ -14,11 +14,16 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "gbcore.h"
 #include "touchui.h"
 #include "link.h"
 #include "net.h"
 #include "cpubot.h"
+#include "update.h"
+#ifndef APP_VERSION
+#define APP_VERSION "dev"
+#endif
 
 /* VS CPU: a second, fully separate copy of the core (every symbol renamed
  * with a b_ prefix at build time) runs the bot's Game Boy */
@@ -106,7 +111,7 @@ static int hard_drop_hold;      /* frames to keep DOWN held after a hard drop */
 static int64_t hint_until;      /* controls hint shown for a while after launch */
 static Macro macro;             /* scripted presses from menu taps */
 /* 2-player link */
-enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM, LUI_CTL, LUI_INVITE };
+enum { LUI_NONE, LUI_MENU, LUI_SEARCH, LUI_MSG, LUI_CPU, LUI_ROM, LUI_CTL, LUI_INVITE, LUI_KEYS, LUI_HOME, LUI_UPDATE };
 static int lui;                 /* link overlay state */
 static char lui_msg[64];
 static int64_t linked_toast_until;
@@ -124,7 +129,7 @@ static int hard_drops;          /* stats / testing */
 typedef struct { int x, y, w, h; } Rc;
 static struct {
     int W, H, scale_num, scale_den;
-    Rc screen, bezel, bsel, bstart, hint, spk, wheel, bctl;
+    Rc screen, bezel, bsel, bstart, hint, spk, wheel, bctl, bhome;
     int landscape;
 } L;
 static int layout_gen;
@@ -173,6 +178,14 @@ static uint8_t held_from_pointers(void) {
 
 static void overlay_tap(float x, float y);
 static void open_controls(void);
+static void trackpad_toggle(void);
+static void home_request(void);
+static int trackpad_mode;                /* setting: use a laptop/DeX trackpad like a touch screen */
+static volatile int trackpad_captured;   /* the pointer is captured right now (UI thread updates it) */
+static int full_redraws_left;
+static int64_t trackpad_toast_until;
+static long update_skip;                  /* the player said LATER for this update version */
+static void update_later(void);
 static int64_t insert_anim_t0;
 static void finish_insert_anim(void);
 static void unlink_session(const char *why);
@@ -216,6 +229,7 @@ static void ptr_down(int id, float x, float y, int64_t t) {
     else if (in_btn(L.bsel, x, y)) p->kind = 1;
     else if (in_btn(L.bstart, x, y)) p->kind = 2;
     else if (lui == LUI_NONE && rom_ready && L.bctl.w > 0 && in_btn(L.bctl, x, y)) p->kind = 5;
+    else if (lui == LUI_NONE && rom_ready && L.bhome.w > 0 && in_btn(L.bhome, x, y)) p->kind = 6;
     else p->kind = 0;
     hist_add(p, x, y, t);
 }
@@ -293,9 +307,9 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
         if (!cancel && clean && p->kind == 1) queue_press(BTN_SELECT);
         if (!cancel && clean && p->kind == 2 && !p->reset_done) queue_press(BTN_START);
     }
-    if (!cancel && p->kind == 5) {
+    if (!cancel && (p->kind == 5 || p->kind == 6)) {
         float mdx = x - p->x0, mdy = y - p->y0, slop = dpi * 0.12f;
-        if (mdx * mdx + mdy * mdy < slop * slop) open_controls();
+        if (mdx * mdx + mdy * mdy < slop * slop) { if (p->kind == 5) open_controls(); else home_request(); }
     }
     if (!cancel && p->kind == 4) {
         vol_muted = !vol_muted;
@@ -341,7 +355,10 @@ static void ptr_up(int id, float x, float y, int64_t t, int cancel) {
     p->active = 0;
 }
 
+static int handle_captured_motion(AInputEvent *ev, int src);
 static int handle_motion(AInputEvent *ev) {
+    int src = AInputEvent_getSource(ev);
+    if (src == AINPUT_SOURCE_TOUCHPAD || src == AINPUT_SOURCE_MOUSE_RELATIVE) return handle_captured_motion(ev, src);
     int32_t a = AMotionEvent_getAction(ev);
     int act = a & AMOTION_EVENT_ACTION_MASK;
     int idx = (a & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
@@ -369,31 +386,111 @@ static int handle_motion(AInputEvent *ev) {
     return 1;
 }
 
-static int key_to_btn(int code) {
-    switch (code) {
-    case AKEYCODE_DPAD_LEFT: case AKEYCODE_A: return BTN_LEFT;
-    case AKEYCODE_DPAD_RIGHT: case AKEYCODE_D: return BTN_RIGHT;
-    case AKEYCODE_DPAD_UP: case AKEYCODE_W: return BTN_UP;
-    case AKEYCODE_DPAD_DOWN: case AKEYCODE_S: return BTN_DOWN;
-    case AKEYCODE_X: case AKEYCODE_K: case AKEYCODE_BUTTON_A: case AKEYCODE_BUTTON_Y: return BTN_A;
-    case AKEYCODE_Z: case AKEYCODE_J: case AKEYCODE_BUTTON_B: case AKEYCODE_BUTTON_X: return BTN_B;
-    case AKEYCODE_ENTER: case AKEYCODE_NUMPAD_ENTER: case AKEYCODE_BUTTON_START: return BTN_START;
-    case AKEYCODE_SHIFT_LEFT: case AKEYCODE_SHIFT_RIGHT: case AKEYCODE_DEL: case AKEYCODE_TAB:
-    case AKEYCODE_BUTTON_SELECT: return BTN_SELECT;
+/* ---- keyboard: rebindable keys (CONTROLS > KEYS) ---- */
+enum { K_LEFT, K_RIGHT, K_UP, K_DOWN, K_ROT_A, K_ROT_B, K_DROP, K_START, K_SELECT, K_N };
+static const char *const k_label[K_N] = { "MOVE LEFT", "MOVE RIGHT", "UP (MENUS)", "SOFT DROP", "ROTATE", "ROTATE BACK", "HARD DROP", "START", "SELECT" };
+static const uint8_t k_btn[K_N] = { BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_A, BTN_B, 0, BTN_START, BTN_SELECT };
+static const int k_default[K_N][2] = {
+    { AKEYCODE_DPAD_LEFT, AKEYCODE_A }, { AKEYCODE_DPAD_RIGHT, AKEYCODE_D }, { AKEYCODE_DPAD_UP, AKEYCODE_W },
+    { AKEYCODE_DPAD_DOWN, AKEYCODE_S }, { AKEYCODE_SPACE, AKEYCODE_X }, { AKEYCODE_Z, AKEYCODE_J },
+    { AKEYCODE_ALT_LEFT, AKEYCODE_ALT_RIGHT }, { AKEYCODE_ENTER, AKEYCODE_NUMPAD_ENTER }, { AKEYCODE_SHIFT_LEFT, AKEYCODE_TAB },
+};
+static int kb[K_N][2];
+static int key_capture = -1;            /* KEYS panel: waiting for a key for this action */
+static void keys_default(void) { memcpy(kb, k_default, sizeof kb); }
+/* keys the player can't take: Back/Esc (leave), F1 (controls), F2 (trackpad), Home (title), volume, system */
+static int key_reserved(int code) {
+    return code == AKEYCODE_BACK || code == AKEYCODE_ESCAPE || code == AKEYCODE_F1 || code == AKEYCODE_F2 ||
+           code == AKEYCODE_MOVE_HOME || code == AKEYCODE_VOLUME_UP || code == AKEYCODE_VOLUME_DOWN ||
+           code == AKEYCODE_VOLUME_MUTE || code == AKEYCODE_POWER || code == AKEYCODE_HOME || code == AKEYCODE_APP_SWITCH ||
+           (code >= AKEYCODE_BUTTON_A && code <= AKEYCODE_BUTTON_MODE) || code <= 0;
+}
+static void key_bind(int act, int code) {
+    for (int a = 0; a < K_N; a++) {                       /* one action per key */
+        for (int k = 0; k < 2; k++) if (kb[a][k] == code) kb[a][k] = 0;
+        if (!kb[a][0]) { kb[a][0] = kb[a][1]; kb[a][1] = 0; }
     }
-    return 0;
+    kb[act][1] = kb[act][0]; kb[act][0] = code;                /* newest first; the older one stays as the second key */
+    if (kb[act][1] == code) kb[act][1] = 0;
+}
+static int key_action(int code) {
+    for (int a = 0; a < K_N; a++) if (code && (kb[a][0] == code || kb[a][1] == code)) return a;
+    switch (code) {     /* game controllers: fixed */
+    case AKEYCODE_BUTTON_A: case AKEYCODE_BUTTON_Y: return K_ROT_A;
+    case AKEYCODE_BUTTON_B: case AKEYCODE_BUTTON_X: return K_ROT_B;
+    case AKEYCODE_BUTTON_R1: return K_DROP;
+    case AKEYCODE_BUTTON_START: return K_START;
+    case AKEYCODE_BUTTON_SELECT: return K_SELECT;
+    }
+    return -1;
+}
+static const char *key_name(int code, char *buf) {
+    if (code >= AKEYCODE_A && code <= AKEYCODE_Z) { buf[0] = (char)('A' + code - AKEYCODE_A); buf[1] = 0; return buf; }
+    if (code >= AKEYCODE_0 && code <= AKEYCODE_9) { buf[0] = (char)('0' + code - AKEYCODE_0); buf[1] = 0; return buf; }
+    if (code >= AKEYCODE_NUMPAD_0 && code <= AKEYCODE_NUMPAD_9) { sprintf(buf, "NUM %d", code - AKEYCODE_NUMPAD_0); return buf; }
+    if (code >= AKEYCODE_F1 && code <= AKEYCODE_F12) { sprintf(buf, "F%d", code - AKEYCODE_F1 + 1); return buf; }
+    switch (code) {
+    case 0: return "-";
+    case AKEYCODE_DPAD_LEFT: return "LEFT";
+    case AKEYCODE_DPAD_RIGHT: return "RIGHT";
+    case AKEYCODE_DPAD_UP: return "UP";
+    case AKEYCODE_DPAD_DOWN: return "DOWN";
+    case AKEYCODE_SPACE: return "SPACE";
+    case AKEYCODE_ENTER: return "ENTER";
+    case AKEYCODE_NUMPAD_ENTER: return "NUM ENT";
+    case AKEYCODE_TAB: return "TAB";
+    case AKEYCODE_SHIFT_LEFT: return "SHIFT";
+    case AKEYCODE_SHIFT_RIGHT: return "R SHIFT";
+    case AKEYCODE_ALT_LEFT: return "ALT";
+    case AKEYCODE_ALT_RIGHT: return "R ALT";
+    case AKEYCODE_CTRL_LEFT: return "CTRL";
+    case AKEYCODE_CTRL_RIGHT: return "R CTRL";
+    case AKEYCODE_DEL: return "BKSP";
+    case AKEYCODE_FORWARD_DEL: return "DELETE";
+    case AKEYCODE_INSERT: return "INSERT";
+    case AKEYCODE_MOVE_END: return "END";
+    case AKEYCODE_PAGE_UP: return "PG UP";
+    case AKEYCODE_PAGE_DOWN: return "PG DN";
+    case AKEYCODE_CAPS_LOCK: return "CAPS";
+    case AKEYCODE_COMMA: return ",";
+    case AKEYCODE_PERIOD: return ".";
+    case AKEYCODE_SLASH: return "/";
+    case AKEYCODE_MINUS: return "-";
+    case AKEYCODE_EQUALS: return "=";
+    case AKEYCODE_LEFT_BRACKET: return "[";
+    case AKEYCODE_RIGHT_BRACKET: return "]";
+    case AKEYCODE_APOSTROPHE: return "'";
+    case AKEYCODE_SEMICOLON: return "SEMI";
+    case AKEYCODE_BACKSLASH: return "BKSLASH";
+    case AKEYCODE_GRAVE: return "GRAVE";
+    }
+    sprintf(buf, "KEY %d", code);
+    return buf;
 }
 
 static int handle_key(AInputEvent *ev) {
     int code = AKeyEvent_getKeyCode(ev);
     int action = AKeyEvent_getAction(ev);
+    if (lui == LUI_KEYS && key_capture >= 0) {          /* binding a key */
+        if (action == AKEY_EVENT_ACTION_UP) {
+            if (code == AKEYCODE_ESCAPE || code == AKEYCODE_BACK) key_capture = -1;
+            else if (!key_reserved(code)) { key_bind(key_capture, code); key_capture = -1; save_settings(); }
+            full_redraws_left = 4;
+        }
+        return 1;
+    }
+    if ((code == AKEYCODE_BACK || code == AKEYCODE_ESCAPE) && action == AKEY_EVENT_ACTION_UP && trackpad_captured) {
+        trackpad_toggle();                                /* Esc first lets go of the trackpad */
+        return 1;
+    }
     if (code == AKEYCODE_BACK || code == AKEYCODE_ESCAPE) {
         if (action == AKEY_EVENT_ACTION_UP && lui == LUI_ROM) { ANativeActivity_finish(app.act); return 1; }
         if (action == AKEY_EVENT_ACTION_UP && lui != LUI_NONE) {
             if (lui == LUI_SEARCH) net_stop();
-            if (lui == LUI_CTL) save_settings();
+            if (lui == LUI_CTL || lui == LUI_KEYS) save_settings();
             if (lui == LUI_INVITE) net_invite_answer(0);
-            lui = lui == LUI_CPU ? LUI_MENU : LUI_NONE;
+            if (lui == LUI_UPDATE) update_later();
+            lui = lui == LUI_CPU ? LUI_MENU : lui == LUI_KEYS ? LUI_CTL : LUI_NONE;
             return 1;
         }
         if (action == AKEY_EVENT_ACTION_UP && linked) {
@@ -415,23 +512,20 @@ static int handle_key(AInputEvent *ev) {
         }
         return 1;
     }
-    /* hard drop: Space, or Up / R1 while playing (Up does nothing in-game on the original) */
-    if (code == AKEYCODE_SPACE || code == AKEYCODE_BUTTON_R1 ||
-        (in_game_unpaused() && (code == AKEYCODE_DPAD_UP || code == AKEYCODE_W))) {
-        if (in_game_unpaused()) {
-            if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(ev) == 0) hard_drop_req = 1;
-            return 1;
-        }
-        if (code == AKEYCODE_SPACE || code == AKEYCODE_BUTTON_R1) {   /* menus: act as Start */
-            if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(ev) == 0) queue_press(BTN_START);
-            return 1;
-        }
+    int down = action == AKEY_EVENT_ACTION_DOWN, first = down && AKeyEvent_getRepeatCount(ev) == 0;
+    /* shortcuts: F1 controls, F2 trackpad, Home key = back to the title screen */
+    if (code == AKEYCODE_F1) { if (first && rom_ready) { if (lui == LUI_NONE) open_controls(); else if (lui == LUI_CTL) { save_settings(); lui = LUI_NONE; } } return 1; }
+    if (code == AKEYCODE_F2) { if (first) trackpad_toggle(); return 1; }
+    if (code == AKEYCODE_MOVE_HOME) { if (first && rom_ready && lui == LUI_NONE) home_request(); return 1; }
+    int act = key_action(code);
+    if (act < 0) return 0;      /* volume keys etc. go to the system */
+    if (act == K_DROP) {
+        if (first && in_game_unpaused()) hard_drop_req = 1;
+        return 1;
     }
-    int b = key_to_btn(code);
-    if (!b) return 0;   /* volume keys etc. go to the system */
-    if (action == AKEY_EVENT_ACTION_DOWN) {
-        if (AKeyEvent_getRepeatCount(ev) == 0) key_held |= (uint8_t)b;
-    } else if (action == AKEY_EVENT_ACTION_UP) key_held &= (uint8_t)~b;
+    uint8_t b = k_btn[act];
+    if (down) { if (AKeyEvent_getRepeatCount(ev) == 0) key_held |= b; }
+    else if (action == AKEY_EVENT_ACTION_UP) key_held &= (uint8_t)~b;
     return 1;
 }
 
@@ -607,8 +701,9 @@ static void compute_layout(int W, int H) {
         int by = L.bezel.y + L.bezel.h + (int)(64 * dp);   /* well clear of the play field */
         L.bsel = (Rc){cx + cw / 2 - gap / 2 - btn_w, by, btn_w, btn_h};
         L.bstart = (Rc){cx + cw / 2 + gap / 2, by, btn_w, btn_h};
-        int ch_ = (int)(28 * dp), cwid = (int)(120 * dp);
-        L.bctl = (Rc){cx + (cw - cwid) / 2, by + btn_h + (int)(16 * dp), cwid, ch_};
+        int ch_ = (int)(28 * dp), cwid = (int)(110 * dp), hw = (int)(80 * dp);
+        L.bhome = (Rc){cx + cw / 2 - gap / 2 - hw, by + btn_h + (int)(16 * dp), hw, ch_};
+        L.bctl = (Rc){cx + cw / 2 + gap / 2, by + btn_h + (int)(16 * dp), cwid, ch_};
         L.hint = (Rc){cx, L.bctl.y + ch_ + (int)(18 * dp), cw, 0};
         /* mute button on the left of the row, DMG-style volume wheel on the right */
         int ww = (int)(btn_h * 0.55f), wh = (int)(btn_h * 1.5f);
@@ -625,6 +720,7 @@ static void compute_layout(int W, int H) {
         L.bstart = (Rc){L.bezel.x + L.bezel.w + (rw - bw) / 2, by, bw, btn_h};
         L.hint = (Rc){0, 0, 0, 0};
         L.bctl = (Rc){cx + (lw - bw) / 2, L.bezel.y, bw, (int)(28 * dp)};
+        L.bhome = (Rc){cx + (lw - bw) / 2, L.bezel.y + (int)(40 * dp), bw, (int)(28 * dp)};
         int ww = (int)(btn_h * 0.55f), wh = (int)(btn_h * 1.5f);
         L.spk = (Rc){cx + (lw - btn_h) / 2, by - (int)(16 * dp) - btn_h, btn_h, btn_h};
         L.wheel = (Rc){L.bezel.x + L.bezel.w + (rw - ww) / 2, by - (int)(16 * dp) - wh, ww, wh};
@@ -712,7 +808,7 @@ static void render(void) {
     int hint = hint_until > t;
     int ui_key = (!!(held & BTN_SELECT)) << 2 | (!!(held & BTN_START)) << 3 | hint << 4 | ((int)(start_prog * 20) << 5)
                | (vol_level << 10) | (vol_muted << 14) | (any_ptr_kind(3) << 15) | (any_ptr_kind(4) << 16) | (any_ptr_kind(5) << 17)
-               | (rom_ready << 18) | (layout_gen << 19);
+               | (rom_ready << 18) | (any_ptr_kind(6) << 19) | (layout_gen << 20);
     if (ui_key != last_ui_key) { full_redraws_left = 4; last_ui_key = ui_key; }
 
     ANativeWindow_Buffer buf;
@@ -758,6 +854,7 @@ static void render(void) {
         draw_button(&c, L.bsel, "SELECT", held & BTN_SELECT, bts);
         draw_button(&c, L.bstart, "START", held & BTN_START, bts);
         if (rom_ready && L.bctl.w > 0) draw_button(&c, L.bctl, "CONTROLS", any_ptr_kind(5), bts > 3 ? bts - 1 : bts);
+        if (rom_ready && L.bhome.w > 0) draw_button(&c, L.bhome, "HOME", any_ptr_kind(6), bts > 3 ? bts - 1 : bts);
         if (start_prog > 0) {
             Rc f = L.bstart; f.w = (int)(L.bstart.w * start_prog);
             Rc bar = { f.x + f.h / 4, f.y + f.h - f.h / 6 - 2, f.w - f.h / 2, f.h / 8 > 2 ? f.h / 8 : 2 };
@@ -782,6 +879,14 @@ static void render(void) {
         float dp = dpi / 160.f;
         int tsc = (int)(dp * 1.6f + 0.5f); if (tsc < 2) tsc = 2;
         if (lui != LUI_NONE) draw_overlay(&c, tsc);
+        else if (trackpad_toast_until > t) {
+            const char *b = trackpad_mode ? "TRACKPAD ON - ESC TO LET GO" : "TRACKPAD OFF";
+            int bs = tsc; while (bs > 1 && text_w(b, bs) + 8 * bs > L.screen.w) bs--;
+            int ww = text_w(b, bs) + 8 * bs, hh = 11 * bs;
+            Rc r = { L.screen.x + (L.screen.w - ww) / 2, L.screen.y + L.screen.h - hh - bs * 4, ww, hh };
+            rrect(&c, r, hh / 2, C_BTNON);
+            text_c(&c, r.x + ww / 2, r.y + 2 * bs, b, bs, C_TEXT);
+        }
         else if (linked) {
             static const char *lvl[3] = { "CPU EASY", "CPU NORMAL", "CPU HARD" };
             const char *b = linked_toast_until > t
@@ -970,19 +1075,33 @@ static void save_settings(void) {
     if (!app.state_path[0] || import_mode) return;
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
     FILE *f = fopen(p, "w");
-    if (f) { fprintf(f, "vol %d\nmute %d\ntouch %d\nflick %d\nonline %d\n", vol_level, vol_muted, sens_touch, sens_flick, show_online); fclose(f); }
+    if (f) {
+        fprintf(f, "vol %d\nmute %d\ntouch %d\nflick %d\nonline %d\ntrackpad %d\nskipver %ld\n", vol_level, vol_muted, sens_touch, sens_flick, show_online, trackpad_mode, update_skip);
+        for (int a = 0; a < K_N; a++) fprintf(f, "bind%d %d %d\n", a, kb[a][0], kb[a][1]);
+        fclose(f);
+    }
 }
 static void load_settings(void) {
+    keys_default();
     char p[600]; snprintf(p, sizeof p, "%s.settings", app.state_path);
     FILE *f = fopen(p, "r");
     if (!f) return;
-    char key[16]; int v;
-    while (fscanf(f, "%15s %d", key, &v) == 2) {
+    char line[96], key[16]; int v, v2;
+    while (fgets(line, sizeof line, f)) {
+        int n = sscanf(line, "%15s %d %d", key, &v, &v2);
+        if (n < 2) continue;
+        if (!strncmp(key, "bind", 4) && n == 3) {
+            int a = atoi(key + 4);
+            if (a >= 0 && a < K_N) { kb[a][0] = v; kb[a][1] = v2; }
+            continue;
+        }
         if (!strcmp(key, "vol") && v >= 0 && v <= VOL_MAX) vol_level = v;
         else if (!strcmp(key, "mute")) vol_muted = v ? 1 : 0;
         else if (!strcmp(key, "touch") && v >= 1 && v <= SENS_MAX) sens_touch = v;
         else if (!strcmp(key, "flick") && v >= 0 && v <= SENS_MAX) sens_flick = v;
         else if (!strcmp(key, "online")) show_online = v ? 1 : 0;
+        else if (!strcmp(key, "trackpad")) trackpad_mode = v ? 1 : 0;
+        else if (!strcmp(key, "skipver")) update_skip = atol(line + 8);
     }
     fclose(f);
 }
@@ -1427,18 +1546,224 @@ static void draw_slider(Canvas *c, Rc row, int v, int lo, int hi, int ts) {
     Rc knob = { kx - kr, bar.y + bar.h / 2 - kr, 2 * kr, 2 * kr };
     rrect(c, knob, kr, C_TEXT);
 }
+
+/* ------------------------------------------------------------------ */
+/* HOME: straight back to the title screen                            */
+/* ------------------------------------------------------------------ */
+static int home_pending; static int64_t home_t0, home_last_start;
+static void go_home(void) {
+    if (linked) unlink_session(NULL);
+    if (gb_peek(0xFFE1) != 0x07) do_soft_reset();
+    home_pending = 1; home_t0 = now_ns(); home_last_start = 0;
+    lui = LUI_NONE; full_redraws_left = 4;
+}
+static void home_request(void) {
+    if (!rom_ready) return;
+    if (gb_peek(0xFFE1) == 0x07 && !linked) return;                      /* already there */
+    if (tetris_single_busy() || linked || tetris_is_2player()) { lui = LUI_HOME; full_redraws_left = 4; }   /* ask first mid-game */
+    else go_home();
+}
+/* after the reset: tap START on the copyright screen as soon as it allows, until the title shows */
+static void home_service(int64_t t) {
+    if (!home_pending) return;
+    int st = gb_peek(0xFFE1);
+    if (st == 0x07 || t - home_t0 > 15000000000LL) { home_pending = 0; return; }
+    if (st == 0x35 && macro.pos >= macro.n && t - home_last_start > 300000000LL) { queue_press(BTN_START); home_last_start = t; }
+}
+static void home_tap(float x, float y) {
+    if (in_rc(O.b4, x, y)) go_home();
+    else if (in_rc(O.b6, x, y)) { lui = LUI_NONE; full_redraws_left = 4; }
+}
+static void draw_home_panel(Canvas *c, Rc in, int cx, int bts) {
+    const char *l1 = linked ? "THIS ENDS THE 2-PLAYER LINK" : "YOUR CURRENT GAME WILL END";
+    int ms = bts; while (ms > 1 && text_w(l1, ms) > in.w - 16) ms--;
+    text_c(c, cx, O.b2.y, l1, ms, C_TEXT);
+    draw_button(c, O.b4, "YES, GO TO TITLE", 1, bts);
+    draw_button(c, O.b6, "KEEP PLAYING", 0, bts);
+}
+
+/* ------------------------------------------------------------------ */
+/* update check: "a newer version is on GitHub"                        */
+/* ------------------------------------------------------------------ */
+static int update_shown;
+static char update_ver[16];
+static void update_later(void) {
+    update_skip = update_version_number(update_ver);
+    save_settings();
+}
+static void update_service(void) {
+    static int started;
+    if (!started && rom_ready && !import_mode) { started = 1; update_check_start(app.act->vm, APP_VERSION); }
+    if (update_shown || lui != LUI_NONE || linked || vs_cpu || tetris_single_busy() || insert_anim_t0) return;
+    if (update_available(update_ver, sizeof update_ver) && update_version_number(update_ver) != update_skip) {
+        update_shown = 1; lui = LUI_UPDATE; full_redraws_left = 4;
+    }
+}
+static void update_tap(float x, float y) {
+    if (in_rc(O.b4, x, y)) { update_open_page(app.act->vm, app.act->clazz); lui = LUI_NONE; }
+    else if (in_rc(O.b6, x, y)) { update_later(); lui = LUI_NONE; }
+    full_redraws_left = 4;
+}
+static void draw_update_panel(Canvas *c, Rc in, int cx, int bts) {
+    char l1[48], l2[48];
+    snprintf(l1, sizeof l1, "VERSION %s IS OUT", update_ver);
+    snprintf(l2, sizeof l2, "YOU HAVE %s", APP_VERSION);
+    int ms = bts; while (ms > 1 && text_w("ONLINE NEEDS EVERYONE ON THE SAME", ms) > in.w - 16) ms--;
+    text_c(c, cx, O.b1.y + O.b1.h / 2, l1, ms, C_TEXT);
+    text_c(c, cx, O.b1.y + O.b1.h / 2 + 10 * ms, l2, ms, C_DIM);
+    text_c(c, cx, O.b3.y, "ONLINE NEEDS EVERYONE ON THE SAME", ms, C_DIM);
+    text_c(c, cx, O.b3.y + 10 * ms, "VERSION TO SEE EACH OTHER", ms, C_DIM);
+    draw_button(c, O.b4, "GET THE UPDATE", 1, bts);
+    draw_button(c, O.b6, "LATER", 0, bts);
+}
+
+/* ------------------------------------------------------------------ */
+/* trackpad as a touch surface (pointer capture, DeX / laptops)       */
+/* ------------------------------------------------------------------ */
+/* Pointer capture can only be asked for on the UI thread: the game thread
+ * writes a byte into a pipe watched by the UI thread's looper. */
+static int ui_pipe[2] = { -1, -1 };
+static int ui_has_focus;
+static void ui_capture(int on) {           /* UI thread */
+    JNIEnv *e = app.act->env;
+    if (!e) return;
+    if ((*e)->PushLocalFrame(e, 16) != 0) return;
+    jclass cA = (*e)->FindClass(e, "android/app/Activity");
+    jobject win = (*e)->CallObjectMethod(e, app.act->clazz, (*e)->GetMethodID(e, cA, "getWindow", "()Landroid/view/Window;"));
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); win = NULL; }
+    jclass cW = (*e)->FindClass(e, "android/view/Window");
+    jobject decor = win ? (*e)->CallObjectMethod(e, win, (*e)->GetMethodID(e, cW, "getDecorView", "()Landroid/view/View;")) : NULL;
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); decor = NULL; }
+    if (decor) {
+        jclass cV = (*e)->FindClass(e, "android/view/View");
+        (*e)->CallVoidMethod(e, decor, (*e)->GetMethodID(e, cV, on ? "requestPointerCapture" : "releasePointerCapture", "()V"));
+        if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e);
+        jboolean has = (*e)->CallBooleanMethod(e, decor, (*e)->GetMethodID(e, cV, "hasPointerCapture", "()Z"));
+        if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); has = 0; }
+        trackpad_captured = on && (has || ui_has_focus);   /* capture lands once the window has focus */
+    }
+    (*e)->PopLocalFrame(e, NULL);
+}
+static int ui_pipe_cb(int fd, int events, void *data) {
+    (void)events; (void)data;
+    char cmd[16]; ssize_t n = read(fd, cmd, sizeof cmd);
+    for (ssize_t i = 0; i < n; i++) ui_capture(cmd[i] == 'C');
+    return 1;
+}
+static void ui_send(char c) { if (ui_pipe[1] >= 0) { if (write(ui_pipe[1], &c, 1) < 0) {} } }
+/* once per frame: hold the capture while playing, let go for menus so the pointer can click */
+static void trackpad_service(int active) {
+    static int sent = -1;
+    int want = trackpad_mode && active && rom_ready && (lui == LUI_NONE) && !insert_anim_t0;
+    if (want != sent) { ui_send(want ? 'C' : 'R'); sent = want; }
+    if (!want) trackpad_captured = 0;
+}
+static void trackpad_toggle(void) {
+    trackpad_mode = !trackpad_mode;
+    trackpad_toast_until = now_ns() + 3500000000LL;
+    save_settings();
+    full_redraws_left = 4;
+}
+/* captured trackpad / mouse events -> the same gestures as fingers on the screen */
+static struct { int dev; float minx, maxx, miny, maxy, resx, resy; } pad;
+static void pad_ranges(int dev) {
+    if (pad.dev == dev && pad.maxx > pad.minx) return;
+    pad.dev = dev; pad.minx = 0; pad.maxx = 1000; pad.miny = 0; pad.maxy = 700; pad.resx = pad.resy = 10;   /* ~100 mm pad if unknown */
+#ifdef __ANDROID__
+    JNIEnv *e = NULL;
+    JavaVM *vm = app.act->vm;
+    if ((*vm)->GetEnv(vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK && (*vm)->AttachCurrentThread(vm, &e, NULL) != JNI_OK) return;
+    if ((*e)->PushLocalFrame(e, 16) != 0) return;
+    jclass cD = (*e)->FindClass(e, "android/view/InputDevice");
+    jobject d = cD ? (*e)->CallStaticObjectMethod(e, cD, (*e)->GetStaticMethodID(e, cD, "getDevice", "(I)Landroid/view/InputDevice;"), dev) : NULL;
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); d = NULL; }
+    for (int axis = 0; d && axis < 2; axis++) {
+        jobject r = (*e)->CallObjectMethod(e, d, (*e)->GetMethodID(e, cD, "getMotionRange", "(II)Landroid/view/InputDevice$MotionRange;"),
+                                           axis, (jint)AINPUT_SOURCE_TOUCHPAD);
+        if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); r = NULL; }
+        if (!r) continue;
+        jclass cR = (*e)->FindClass(e, "android/view/InputDevice$MotionRange");
+        float mn = (*e)->CallFloatMethod(e, r, (*e)->GetMethodID(e, cR, "getMin", "()F"));
+        float mx = (*e)->CallFloatMethod(e, r, (*e)->GetMethodID(e, cR, "getMax", "()F"));
+        float rs = (*e)->CallFloatMethod(e, r, (*e)->GetMethodID(e, cR, "getResolution", "()F"));
+        if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); continue; }
+        if (mx > mn) {
+            if (rs <= 0) rs = (mx - mn) / (axis ? 65.f : 100.f);
+            if (axis) { pad.miny = mn; pad.maxy = mx; pad.resy = rs; } else { pad.minx = mn; pad.maxx = mx; pad.resx = rs; }
+        }
+    }
+    (*e)->PopLocalFrame(e, NULL);
+#endif
+}
+static void pad_to_screen(float x, float y, float *sx, float *sy) {
+    float ppmm = dpi / 25.4f;      /* the pad is used at its real size */
+    *sx = (float)L.W / 2 + (x - (pad.minx + pad.maxx) / 2) / pad.resx * ppmm;
+    *sy = (float)(L.screen.y + L.screen.h / 2) + (y - (pad.miny + pad.maxy) / 2) / pad.resy * ppmm;
+}
+static float rel_x, rel_y;                 /* a captured mouse: a virtual finger moved by the deltas */
+static int handle_captured_motion(AInputEvent *ev, int src) {
+    int32_t a = AMotionEvent_getAction(ev);
+    int act = a & AMOTION_EVENT_ACTION_MASK;
+    int idx = (a & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+    int64_t t = AMotionEvent_getEventTime(ev);
+    if (src == AINPUT_SOURCE_MOUSE_RELATIVE) {
+        if (act == AMOTION_EVENT_ACTION_DOWN) { rel_x = (float)L.W / 2; rel_y = (float)(L.screen.y + L.screen.h / 2); ptr_down(900, rel_x, rel_y, t); }
+        else if (act == AMOTION_EVENT_ACTION_MOVE) { rel_x += AMotionEvent_getX(ev, 0) * 1.5f; rel_y += AMotionEvent_getY(ev, 0) * 1.5f; ptr_move(900, rel_x, rel_y, t); }
+        else if (act == AMOTION_EVENT_ACTION_UP) ptr_up(900, rel_x, rel_y, t, 0);
+        return 1;
+    }
+    pad_ranges(AInputEvent_getDeviceId(ev));
+    float sx, sy;
+    switch (act) {
+    case AMOTION_EVENT_ACTION_DOWN:
+    case AMOTION_EVENT_ACTION_POINTER_DOWN:
+        pad_to_screen(AMotionEvent_getX(ev, idx), AMotionEvent_getY(ev, idx), &sx, &sy);
+        ptr_down(100 + AMotionEvent_getPointerId(ev, idx), sx, sy, t);
+        break;
+    case AMOTION_EVENT_ACTION_MOVE:
+        for (size_t i = 0; i < AMotionEvent_getPointerCount(ev); i++) {
+            pad_to_screen(AMotionEvent_getX(ev, i), AMotionEvent_getY(ev, i), &sx, &sy);
+            ptr_move(100 + AMotionEvent_getPointerId(ev, i), sx, sy, t);
+        }
+        break;
+    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_POINTER_UP:
+        pad_to_screen(AMotionEvent_getX(ev, idx), AMotionEvent_getY(ev, idx), &sx, &sy);
+        ptr_move(100 + AMotionEvent_getPointerId(ev, idx), sx, sy, t);
+        ptr_up(100 + AMotionEvent_getPointerId(ev, idx), sx, sy, t, 0);
+        break;
+    case AMOTION_EVENT_ACTION_CANCEL:
+        for (int i = 0; i < MAXP; i++) if (ptrs[i].id >= 100) ptrs[i].active = 0;
+        break;
+    }
+    return 1;
+}
+
+/* CONTROLS panel rows (inside the overlay panel) */
+static void ctl_rows(Rc r[7]) {
+    int rh = O.panel.h / 11, gap = rh / 5, x = O.b1.x, w = O.b1.w;
+    int y = O.panel.y + O.panel.h / 7;
+    for (int i = 0; i < 7; i++) { r[i] = (Rc){ x, y, w, rh }; y += rh + gap; }
+}
+static void split2(Rc r, Rc *a, Rc *b) {
+    *a = r; a->w = r.w / 2 - r.h / 8; *b = *a; b->x = r.x + r.w - a->w;
+}
 static void ctl_tap(float x, float y) {
+    Rc r[7], ra, rb; ctl_rows(r);
     int changed = 0;
-    changed |= slider_tap(O.b2, x, y, &sens_touch, 1, SENS_MAX);
-    changed |= slider_tap(O.b4, x, y, &sens_flick, 0, SENS_MAX);
-    Rc reset = O.b6, done = O.b6;
-    reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
-    if (in_rc(O.b5, x, y)) { show_online = !show_online; changed = 1; }
-    if (in_rc(reset, x, y)) { sens_touch = 5; sens_flick = 5; changed = 1; }
-    else if (in_rc(done, x, y)) { save_settings(); lui = LUI_NONE; full_redraws_left = 4; return; }
+    changed |= slider_tap(r[1], x, y, &sens_touch, 1, SENS_MAX);
+    changed |= slider_tap(r[3], x, y, &sens_flick, 0, SENS_MAX);
+    split2(r[4], &ra, &rb);
+    if (in_rc(ra, x, y)) { show_online = !show_online; changed = 1; }
+    if (in_rc(rb, x, y)) { trackpad_toggle(); changed = 1; }
+    if (in_rc(r[5], x, y)) { save_settings(); key_capture = -1; lui = LUI_KEYS; full_redraws_left = 4; return; }
+    split2(r[6], &ra, &rb);
+    if (in_rc(ra, x, y)) { sens_touch = 5; sens_flick = 5; changed = 1; }
+    else if (in_rc(rb, x, y)) { save_settings(); lui = LUI_NONE; full_redraws_left = 4; return; }
     if (changed) { save_settings(); full_redraws_left = 4; }
 }
 static void draw_ctl_panel(Canvas *c, Rc in, int cx, int bts) {
+    Rc r[7], ra, rb; ctl_rows(r);
     char l1[40], l2[40], l3[48];
     snprintf(l1, sizeof l1, "SWIPE SENSITIVITY  %d", sens_touch);
     if (sens_flick) snprintf(l2, sizeof l2, "HARD DROP FLICK  %d", sens_flick);
@@ -1447,16 +1772,57 @@ static void draw_ctl_panel(Canvas *c, Rc in, int cx, int bts) {
     int ms = bts;
     const char *w[] = { l1, l2, l3 };
     for (int i = 0; i < 3; i++) while (ms > 1 && text_w(w[i], ms) > in.w - 16) ms--;
-    text_c(c, cx, O.b1.y + O.b1.h / 2 - 3 * ms, l1, ms, C_TEXT);
-    draw_slider(c, O.b2, sens_touch, 1, SENS_MAX, bts);
-    text_c(c, cx, O.b3.y + O.b3.h / 2 - 3 * ms, l2, ms, C_TEXT);
-    draw_slider(c, O.b4, sens_flick, 0, SENS_MAX, bts);
-    draw_button(c, O.b5, show_online ? "SHOW ME ONLINE: YES" : "SHOW ME ONLINE: NO", show_online, bts);
-    text_c(c, cx, O.b6.y + O.b6.h + 2 * ms, l3, ms, C_DIM);
-    Rc reset = O.b6, done = O.b6;
-    reset.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - reset.w; done.w = reset.w;
-    draw_button(c, reset, "RESET", 0, bts);
-    draw_button(c, done, "DONE", 0, bts);
+    text_c(c, cx, r[0].y + r[0].h / 2 - 3 * ms, l1, ms, C_TEXT);
+    draw_slider(c, r[1], sens_touch, 1, SENS_MAX, bts);
+    text_c(c, cx, r[2].y + r[2].h / 2 - 3 * ms, l2, ms, C_TEXT);
+    draw_slider(c, r[3], sens_flick, 0, SENS_MAX, bts);
+    split2(r[4], &ra, &rb);
+    draw_button(c, ra, show_online ? "ONLINE: SHOWN" : "ONLINE: HIDDEN", show_online, bts);
+    draw_button(c, rb, trackpad_mode ? "TRACKPAD: ON" : "TRACKPAD: OFF", trackpad_mode, bts);
+    draw_button(c, r[5], "KEYBOARD KEYS...", 0, bts);
+    split2(r[6], &ra, &rb);
+    draw_button(c, ra, "RESET", 0, bts);
+    draw_button(c, rb, "DONE", 0, bts);
+    text_c(c, cx, r[6].y + r[6].h + 2 * ms, l3, ms, C_DIM);
+}
+
+/* KEYS panel: tap an action, then press the key for it (Esc cancels) */
+static void keys_rows(Rc r[K_N + 1]) {
+    int top = O.panel.y + O.panel.h / 7, avail = O.panel.y + O.panel.h - top - O.panel.h / 30;
+    int rh = avail / (K_N + 1), x = O.b1.x, w = O.b1.w;
+    for (int i = 0; i <= K_N; i++) r[i] = (Rc){ x, top + i * rh, w, rh - rh / 6 };
+}
+static void keys_tap(float x, float y) {
+    Rc r[K_N + 1], ra, rb; keys_rows(r);
+    for (int i = 0; i < K_N; i++) if (in_rc(r[i], x, y)) { key_capture = key_capture == i ? -1 : i; full_redraws_left = 4; return; }
+    split2(r[K_N], &ra, &rb);
+    if (in_rc(ra, x, y)) { keys_default(); key_capture = -1; save_settings(); full_redraws_left = 4; }
+    else if (in_rc(rb, x, y)) { key_capture = -1; save_settings(); lui = LUI_CTL; full_redraws_left = 4; }
+}
+static void draw_keys_panel(Canvas *c, Rc in, int bts) {
+    Rc r[K_N + 1], ra, rb; keys_rows(r);
+    /* one text size for every row, small enough that the widest label + keys pair fits */
+    int ms = bts;
+    for (int i = 0; i < K_N; i++) {
+        char a[16], b2[16], v[48];
+        snprintf(v, sizeof v, "%s / %s", key_name(kb[i][0], a), key_name(kb[i][1], b2));
+        if (strlen(v) < 11) strcpy(v, "PRESS A KEY");
+        while (ms > 1 && text_w(k_label[i], ms) + text_w(v, ms) + 3 * 6 * ms + r[i].h > r[i].w) ms--;
+        while (ms > 1 && 9 * ms > r[i].h) ms--;
+    }
+    for (int i = 0; i < K_N; i++) {
+        rrect(c, r[i], r[i].h / 2, key_capture == i ? C_BTNON : C_BTN);
+        int ty = r[i].y + r[i].h / 2 - 7 * ms / 2;
+        text(c, r[i].x + r[i].h / 2, ty, k_label[i], ms, C_TEXT);
+        char a[16], b[16], v[48];
+        if (key_capture == i) snprintf(v, sizeof v, "PRESS A KEY");
+        else if (kb[i][1]) snprintf(v, sizeof v, "%s / %s", key_name(kb[i][0], a), key_name(kb[i][1], b));
+        else snprintf(v, sizeof v, "%s", key_name(kb[i][0], a));
+        text(c, r[i].x + r[i].w - r[i].h / 2 - text_w(v, ms), ty, v, ms, key_capture == i ? C_TEXT : C_DIM);
+    }
+    split2(r[K_N], &ra, &rb);
+    draw_button(c, ra, "DEFAULTS", 0, bts);
+    draw_button(c, rb, "DONE", 0, bts);
 }
 
 static void overlay_layout(void) {
@@ -1476,6 +1842,9 @@ static void overlay_tap(float x, float y) {
     overlay_layout();
     if (lui == LUI_ROM) { rom_tap(x, y); return; }
     if (lui == LUI_CTL) { ctl_tap(x, y); return; }
+    if (lui == LUI_KEYS) { keys_tap(x, y); return; }
+    if (lui == LUI_HOME) { home_tap(x, y); return; }
+    if (lui == LUI_UPDATE) { update_tap(x, y); return; }
     if (lui == LUI_INVITE) {
         if (in_rc(O.b4, x, y)) { net_invite_answer(1); lui = LUI_SEARCH; }
         else if (in_rc(O.b6, x, y)) { net_invite_answer(0); lui = LUI_NONE; }
@@ -1519,7 +1888,8 @@ static void draw_overlay(Canvas *c, int tsc) {
     rrect(c, O.panel, O.panel.w / 16, C_BEZEL);
     Rc in = { O.panel.x + 3, O.panel.y + 3, O.panel.w - 6, O.panel.h - 6 };
     rrect(c, in, O.panel.w / 16, C_BG);
-    const char *title = lui == LUI_ROM ? "YOUR TETRIS ROM" : lui == LUI_CTL ? "CONTROLS" : "2 PLAYER LINK";
+    const char *title = lui == LUI_ROM ? "YOUR TETRIS ROM" : lui == LUI_CTL ? "CONTROLS" : lui == LUI_KEYS ? "KEYBOARD KEYS"
+                      : lui == LUI_HOME ? "BACK TO THE TITLE?" : lui == LUI_UPDATE ? "UPDATE AVAILABLE" : "2 PLAYER LINK";
     int ts = tsc;
     while (ts > 1 && text_w(title, ts) > in.w - 20) ts--;
     int cx = O.panel.x + O.panel.w / 2;
@@ -1527,6 +1897,9 @@ static void draw_overlay(Canvas *c, int tsc) {
     int bts = ts > 4 ? 4 : ts;
     if (lui == LUI_ROM) { draw_rom_panel(c, in, cx, bts); return; }
     if (lui == LUI_CTL) { draw_ctl_panel(c, in, cx, bts); return; }
+    if (lui == LUI_KEYS) { draw_keys_panel(c, in, bts); return; }
+    if (lui == LUI_HOME) { draw_home_panel(c, in, cx, bts); return; }
+    if (lui == LUI_UPDATE) { draw_update_panel(c, in, cx, bts); return; }
     if (lui == LUI_INVITE) {
         int ms = bts;
         const char *l1 = "SOMEONE ONLINE WANTS", *l2 = "TO PLAY 2-PLAYER!";
@@ -1648,6 +2021,7 @@ static void *game_thread(void *arg) {
         }
         int active = app.resumed && app.win && !app.destroy;
         if (was_active && !active) {
+            trackpad_service(0);
             net_presence_stop();
             if (linked && net_kind() == NET_KIND_ONLINE) unlink_session("LINK ENDED");
             if (astream) AAudioStream_requestPause(astream);
@@ -1692,6 +2066,9 @@ static void *game_thread(void *arg) {
             continue;
         }
         presence_service();
+        update_service();
+        home_service(now_ns());
+        trackpad_service(1);
         link_service(now_ns());
         check_reset_hold(now_ns());
         /* new buttons only once the Game Boy has finished the previous frame,
@@ -1779,7 +2156,12 @@ static void onPause(ANativeActivity *a) {
 static void onStop(ANativeActivity *a) { (void)a; }
 static void onStart(ANativeActivity *a) { (void)a; }
 static void *onSaveInstanceState(ANativeActivity *a, size_t *n) { (void)a; *n = 0; return NULL; }
-static void onWindowFocusChanged(ANativeActivity *a, int f) { (void)a; (void)f; }
+static void onWindowFocusChanged(ANativeActivity *a, int f) {
+    (void)a;
+    ui_has_focus = f;
+    if (f && trackpad_mode && lui == LUI_NONE && rom_ready) ui_capture(1);   /* capture needs focus: ask again now */
+    if (!f) trackpad_captured = 0;
+}
 static void onWindowCreated(ANativeActivity *a, ANativeWindow *w) { (void)a; set_window(w); }
 static void onWindowDestroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; set_window(NULL); }
 static void onWindowResized(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; }
@@ -1852,6 +2234,12 @@ void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_size
         int d = AConfiguration_getDensity(cfg);
         AConfiguration_delete(cfg);
         if (d > 0 && d < 2000) dpi = (float)d;
+    }
+    /* the game thread asks the UI thread for pointer capture through this pipe */
+    if (ui_pipe[0] < 0 && pipe(ui_pipe) == 0) {
+        fcntl(ui_pipe[0], F_SETFL, fcntl(ui_pipe[0], F_GETFL) | O_NONBLOCK);
+        ALooper *ml = ALooper_forThread();
+        if (ml) ALooper_addFd(ml, ui_pipe[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, ui_pipe_cb, NULL);
     }
     pthread_mutex_init(&app.mu, NULL);
     pthread_cond_init(&app.cv, NULL);

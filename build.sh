@@ -3,13 +3,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 SYSROOT="${SYSROOT:-/root/sysroot}"
+export VERSION_NAME="${VERSION_NAME:-3.4}" VERSION_CODE="${VERSION_CODE:-17}"
 rm -rf build/arm64 build/apk; mkdir -p build/arm64 build/apk/lib/arm64-v8a
 
 # No game code or data goes into the app: the player loads their own ROM on first run.
 # The CPU core is a generic Game Boy instruction interpreter generated without any ROM.
 python3 gen.py --interp core/cpu_interp.c
-CF="${EXTRA_CFLAGS:-} -DGB_INTERP_ONLY --target=aarch64-linux-android28 --sysroot=$SYSROOT -fPIC -O2 -fvisibility=hidden -mno-outline-atomics -fno-stack-protector -Icore -Iandroid"
-for f in android/main.c android/touchui.c android/link.c android/net.c android/cpubot.c android/rom.c core/gbcore.c core/tetris_extras.c core/cpu_interp.c ${EXTRA_SRC:-}; do
+CF="${EXTRA_CFLAGS:-} -DAPP_VERSION=\"$VERSION_NAME\" -DGB_INTERP_ONLY --target=aarch64-linux-android28 --sysroot=$SYSROOT -fPIC -O2 -fvisibility=hidden -mno-outline-atomics -fno-stack-protector -Icore -Iandroid"
+for f in android/main.c android/touchui.c android/link.c android/net.c android/cpubot.c android/rom.c android/update.c core/gbcore.c core/tetris_extras.c core/cpu_interp.c ${EXTRA_SRC:-}; do
   clang $CF -Wall -Wno-unused-function -c "$f" -o "build/arm64/$(basename "$f" .c).o"
 done
 

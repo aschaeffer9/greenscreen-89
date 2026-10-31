@@ -15,7 +15,7 @@
 struct ANativeWindow { int w, h; uint32_t *px; uint32_t *front; int posts; int copyback; int locked; int f565; };
 static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER;
 struct AInputQueue { int dummy; };
-struct AInputEvent { int type, action, n, ids[4]; float xs[4], ys[4]; int key, repeat; int64_t t; };
+struct AInputEvent { int type, action, n, ids[4]; float xs[4], ys[4]; int key, repeat; int64_t t; int source, device; };
 struct ALooper { int d; };
 struct AConfiguration { int d; };
 
@@ -61,6 +61,10 @@ int32_t AInputQueue_getEvent(AInputQueue *q, AInputEvent **e) {
 int32_t AInputQueue_preDispatchEvent(AInputQueue *q, AInputEvent *e) { return 0; }
 void AInputQueue_finishEvent(AInputQueue *q, AInputEvent *e, int h) {}
 int32_t AInputEvent_getType(const AInputEvent *e) { return e->type; }
+int32_t AInputEvent_getSource(const AInputEvent *e) { return e->source ? e->source : AINPUT_SOURCE_TOUCHSCREEN; }
+int32_t AInputEvent_getDeviceId(const AInputEvent *e) { return e->device; }
+ALooper *ALooper_forThread(void) { return NULL; }
+int ALooper_addFd(ALooper *l, int fd, int ident, int events, ALooper_callbackFunc cb, void *data) { return 1; }
 int32_t AMotionEvent_getAction(const AInputEvent *e) { return e->action; }
 int64_t AMotionEvent_getEventTime(const AInputEvent *e) { return e->t; }
 size_t AMotionEvent_getPointerCount(const AInputEvent *e) { return (size_t)e->n; }
@@ -264,6 +268,7 @@ static int run_norom(void);
 static int run_ctl(void);
 static int run_audio(void);
 static int run_online_ui(void);
+static int run_kbd(void);
 /* the tester's own ROM: T89_ROM=/path/to/rom.gb */
 static const char *rom_src(void) { return getenv("T89_ROM") ? getenv("T89_ROM") : "rom/Tetris (World) (Rev A).gb"; }
 static void install_rom(void) {
@@ -277,6 +282,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[2], "ctl")) { install_rom(); return run_ctl(); }
     if (argc > 2 && !strcmp(argv[2], "audio")) { install_rom(); return run_audio(); }
     if (argc > 2 && !strcmp(argv[2], "onlineui")) { install_rom(); return run_online_ui(); }
+    if (argc > 2 && !strcmp(argv[2], "kbd")) { install_rom(); return run_kbd(); }
     install_rom();
     if (argc > 6) return run_2p(argv[4][0], atoi(argv[5]), atoi(argv[6]));
     if (argc > 2 && !strcmp(argv[2], "cpu")) return run_cpu(argc > 3 ? atoi(argv[3]) : 2, argc > 4 ? atoi(argv[4]) : 2);
@@ -652,8 +658,8 @@ static int run_ctl(void) {
         tap(L.bctl.x + L.bctl.w / 2, L.bctl.y + L.bctl.h / 2); wait_frames(5);
         if (i == 0) { fprintf(stderr, "panel open: %d (ctl=%d), game paused: %d\n", lui, LUI_CTL, gb_peek(0xFFAB)); shot("ctl_panel"); }
         overlay_layout();
-        set_slider(O.b2, &sens_touch, levels[i]);
-        Rc done = O.b6; done.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - done.w;
+        Rc rows[7], ra, done; ctl_rows(rows); split2(rows[6], &ra, &done);
+        set_slider(rows[1], &sens_touch, levels[i]);
         ctl_tap_rc(done);
         if (gb_peek(0xFFAB)) { key(AKEYCODE_ENTER); wait_frames(20); }   /* unpause */
         res[i] = cols_for_drag(0.34f);
@@ -664,9 +670,9 @@ static int run_ctl(void) {
     for (int i = 0; i < 3; i++) {
         tap(L.bctl.x + L.bctl.w / 2, L.bctl.y + L.bctl.h / 2); wait_frames(5);
         overlay_layout();
-        set_slider(O.b4, &sens_flick, fl[i]);
+        Rc rows[7], ra, done; ctl_rows(rows); split2(rows[6], &ra, &done);
+        set_slider(rows[3], &sens_flick, fl[i]);
         if (i == 0) shot("ctl_flick_off");
-        Rc done = O.b6; done.w = O.b6.w / 2 - O.b6.h / 6; done.x = O.b6.x + O.b6.w - done.w;
         ctl_tap_rc(done);
         if (gb_peek(0xFFAB)) { key(AKEYCODE_ENTER); wait_frames(20); }
         int hd = hard_drops;
@@ -768,6 +774,100 @@ static int run_online_ui(void) {
     pthread_mutex_lock(&pmu); sess = SS_IDLE; pthread_mutex_unlock(&pmu);   /* (the network thread would do this) */
     wait_frames(5);
     fprintf(stderr, "expired: overlay=%d msg='%s'\n", lui, lui_msg);
+    destroy();
+    return 0;
+}
+
+/* ---------------- 3.4: keyboard defaults + rebinding, HOME, trackpad, update prompt ---------------- */
+static void key_tap(int code) {
+    struct AInputEvent e = { AINPUT_EVENT_TYPE_KEY, AKEY_EVENT_ACTION_DOWN }; e.key = code; push(e); wait_frames(3);
+    e.action = AKEY_EVENT_ACTION_UP; push(e); wait_frames(3);
+}
+static void pad_ev(int act, float x, float y) {
+    struct AInputEvent e = { AINPUT_EVENT_TYPE_MOTION, act, 1, {0}, {x}, {y} };
+    e.source = AINPUT_SOURCE_TOUCHPAD; e.device = 7;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); e.t = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    push(e);
+}
+static int start_solo_game(void) {
+    for (int i = 0; i < 6 && gb_peek(0xFFE1) != 0x00; i++) { key_tap(AKEYCODE_ENTER); wait_frames(40); }
+    return gb_peek(0xFFE1) == 0x00;
+}
+static int run_kbd(void) {
+    char sp[512]; snprintf(sp, sizeof sp, "%s/tetris_state.bin", outdir); remove(sp);
+    char setp[600]; snprintf(setp, sizeof setp, "%s/tetris_state.bin.settings", outdir); remove(setp);
+    win.copyback = 1;
+    create(1080, 2340);
+    wait_frames(330);
+    fprintf(stderr, "solo game started with ENTER: %d\n", start_solo_game());
+    int spec = gb_peek(0xC203); key_tap(AKEYCODE_SPACE); wait_frames(4);
+    fprintf(stderr, "SPACE rotates: %s\n", gb_peek(0xC203) != spec ? "yes" : "NO");
+    int x0 = gb_peek(0xC202); key_tap(AKEYCODE_D); wait_frames(4);
+    fprintf(stderr, "D moves right: %s\n", gb_peek(0xC202) > x0 ? "yes" : "NO");
+    int hd = hard_drops; key_tap(AKEYCODE_ALT_LEFT); wait_frames(8);
+    fprintf(stderr, "ALT hard-drops: %s\n", hard_drops > hd ? "yes" : "NO");
+    hd = hard_drops; key_tap(AKEYCODE_DPAD_UP); wait_frames(8);
+    fprintf(stderr, "UP no longer hard-drops: %s\n", hard_drops == hd ? "yes" : "NO");
+    /* rebind ROTATE to Q through CONTROLS > KEYBOARD KEYS */
+    key_tap(AKEYCODE_F1); wait_frames(5);
+    fprintf(stderr, "F1 opens CONTROLS: %s\n", lui == LUI_CTL ? "yes" : "NO");
+    overlay_layout(); { Rc r[7]; ctl_rows(r); tap(r[5].x + r[5].w / 2, r[5].y + r[5].h / 2); wait_frames(5); }
+    fprintf(stderr, "KEYS panel open: %s\n", lui == LUI_KEYS ? "yes" : "NO");
+    shot("k1_keys");
+    { Rc r[K_N + 1]; keys_rows(r); tap(r[K_ROT_A].x + r[K_ROT_A].w / 2, r[K_ROT_A].y + r[K_ROT_A].h / 2); wait_frames(5);
+      fprintf(stderr, "waiting for a key: %s\n", key_capture == K_ROT_A ? "yes" : "NO");
+      shot("k2_capture");
+      key_tap(AKEYCODE_Q);
+      char a[16], b[16]; fprintf(stderr, "ROTATE now: %s / %s\n", key_name(kb[K_ROT_A][0], a), key_name(kb[K_ROT_A][1], b));
+      /* binding a key that another action has moves it */
+      tap(r[K_DROP].x + r[K_DROP].w / 2, r[K_DROP].y + r[K_DROP].h / 2); wait_frames(5); key_tap(AKEYCODE_D);
+      fprintf(stderr, "D taken by HARD DROP, MOVE RIGHT keeps: %s\n", key_name(kb[K_RIGHT][0], a));
+      tap(r[K_RIGHT].x + r[K_RIGHT].w / 2, r[K_RIGHT].y + r[K_RIGHT].h / 2); wait_frames(5); key_tap(AKEYCODE_D);   /* and back */
+      fprintf(stderr, "D back on MOVE RIGHT: %s, HARD DROP: %s / %s\n", key_name(kb[K_RIGHT][0], a), key_name(kb[K_DROP][0], b), key_name(kb[K_DROP][1], a + 8));
+      shot("k3_bound"); }
+    key_tap(AKEYCODE_ESCAPE); wait_frames(5); key_tap(AKEYCODE_ESCAPE); wait_frames(5);
+    if (gb_peek(0xFFAB)) { key_tap(AKEYCODE_ENTER); wait_frames(20); }
+    spec = gb_peek(0xC203); key_tap(AKEYCODE_Q); wait_frames(4);
+    fprintf(stderr, "Q rotates after rebinding: %s\n", gb_peek(0xC203) != spec ? "yes" : "NO");
+    /* trackpad (captured touchpad events) */
+    trackpad_mode = 1; wait_frames(3);
+    { int xs = gb_peek(0xC202);
+      pad_ev(AMOTION_EVENT_ACTION_DOWN, 500, 300); wait_frames(2);
+      for (int i = 1; i <= 10; i++) { pad_ev(AMOTION_EVENT_ACTION_MOVE, 500 + i * 12, 300); wait_frames(1); }   /* 12 mm to the right */
+      pad_ev(AMOTION_EVENT_ACTION_UP, 620, 300); wait_frames(6);
+      fprintf(stderr, "trackpad drag 12 mm right: moved %d columns\n", (gb_peek(0xC202) - xs) / 8); }
+    { int sp2 = gb_peek(0xC203); pad_ev(AMOTION_EVENT_ACTION_DOWN, 700, 300); wait_frames(2); pad_ev(AMOTION_EVENT_ACTION_UP, 700, 300); wait_frames(6);
+      fprintf(stderr, "trackpad tap rotates: %s\n", gb_peek(0xC203) != sp2 ? "yes" : "NO"); }
+    { int hd2 = hard_drops; pad_ev(AMOTION_EVENT_ACTION_DOWN, 500, 200); msleep(16);
+      for (int i = 1; i <= 4; i++) { pad_ev(AMOTION_EVENT_ACTION_MOVE, 500, 200 + i * 45); msleep(16); }
+      pad_ev(AMOTION_EVENT_ACTION_UP, 500, 380); wait_frames(8);
+      fprintf(stderr, "trackpad flick down 18 mm: hard drop %s\n", hard_drops > hd2 ? "yes" : "NO"); }
+    trackpad_mode = 0;
+    /* HOME mid-game asks first; YES lands on the title */
+    tap(L.bhome.x + L.bhome.w / 2, L.bhome.y + L.bhome.h / 2); wait_frames(5);
+    fprintf(stderr, "HOME mid-game asks first: %s\n", lui == LUI_HOME ? "yes" : "NO");
+    shot("k4_home_confirm");
+    overlay_layout(); tap(O.b4.x + O.b4.w / 2, O.b4.y + O.b4.h / 2);
+    { int w = 0; while (gb_peek(0xFFE1) != 0x07 && w < 900) { wait_frames(10); w += 10; }
+      fprintf(stderr, "HOME -> title after %d frames (state %02x)\n", w, gb_peek(0xFFE1)); }
+    /* HOME from a menu goes straight there */
+    key_tap(AKEYCODE_ENTER); wait_frames(30);
+    fprintf(stderr, "in the game-type menu: state %02x\n", gb_peek(0xFFE1));
+    key_tap(AKEYCODE_MOVE_HOME);
+    { int w = 0; while (gb_peek(0xFFE1) != 0x07 && w < 900) { wait_frames(10); w += 10; }
+      fprintf(stderr, "Home key from a menu -> title after %d frames, no question asked: %s\n", w, lui == LUI_NONE ? "yes" : "NO"); }
+    /* update prompt */
+    update_test_set_latest("3.5");
+    wait_frames(10);
+    fprintf(stderr, "update prompt shown for 3.5: %s\n", lui == LUI_UPDATE ? "yes" : "NO");
+    shot("k5_update");
+    overlay_layout(); tap(O.b6.x + O.b6.w / 2, O.b6.y + O.b6.h / 2); wait_frames(5);
+    fprintf(stderr, "LATER closes it and remembers %ld\n", update_skip);
+    destroy();
+    create(1080, 2340); wait_frames(20);
+    update_test_set_latest("3.5"); wait_frames(10);
+    char a[16], b[16];
+    fprintf(stderr, "after relaunch: ROTATE %s / %s, prompt for skipped 3.5 again: %s\n", key_name(kb[K_ROT_A][0], a), key_name(kb[K_ROT_A][1], b), lui == LUI_UPDATE ? "YES (bad)" : "no");
     destroy();
     return 0;
 }

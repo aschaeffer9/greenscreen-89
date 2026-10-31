@@ -140,8 +140,8 @@ def build_arsc(package_name, icon_path):
 import os
 PACKAGE = os.environ.get('PACKAGE', 'com.ari.greenscreen89')
 LABEL = os.environ.get('LABEL', "Greenscreen '89")
-VERSION_CODE = int(os.environ.get('VERSION_CODE', '16'))
-VERSION_NAME = os.environ.get('VERSION_NAME', '3.3')
+VERSION_CODE = int(os.environ.get('VERSION_CODE', '17'))
+VERSION_NAME = os.environ.get('VERSION_NAME', '3.4')
 
 
 def main():

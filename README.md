@@ -30,19 +30,28 @@ Unofficial fan project, personal and non-commercial. Not affiliated with The Tet
 
 The panel also shows game speed and CPU load per frame, which is handy for checking performance on slower phones.
 
-Keyboards and controllers work too (good for DeX):
+**HOME** (next to CONTROLS, or the Home key) goes straight back to the title screen. Mid-game, it asks first.
 
-| Key | Action |
+Keyboards and controllers work too (good for DeX). Every key can be changed in **CONTROLS > KEYBOARD KEYS**: tap an action, then press a key. Each action holds two keys.
+
+| Default key | Action |
 | --- | --- |
-| Arrows / WASD | Move, soft drop |
-| Up, W or Space (in game) | Hard drop |
-| X, K | A |
-| Z, J | B |
+| Arrows / WASD | Move, soft drop (Up / W for menus) |
+| Space, X | Rotate |
+| Z, J | Rotate back |
+| Alt | Hard drop |
 | Enter | START |
 | Shift, Tab | SELECT |
 | Esc | Back |
+| F1 | CONTROLS |
+| F2 | Trackpad on / off |
+| Home | Back to the title screen |
 
 On controllers, R1 is hard drop.
+
+**Trackpad mode** (CONTROLS, or F2) uses a laptop or DeX trackpad like the touch screen: drag to move, tap to rotate, flick down to hard drop. The pointer is captured while you play; Esc lets it go.
+
+**Updates:** once per launch the app asks GitHub for the latest release. If a newer version is out, it offers to open the releases page. Nothing else is sent.
 
 2PLAYER on the title screen opens the link menu:
 
