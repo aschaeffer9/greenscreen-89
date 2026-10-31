@@ -166,12 +166,14 @@ struct AInputQueue {
     struct AInputEvent q[QCAP];
     int head, tail;
     int attached;
+    int ident;              /* the id the shell passed to attachLooper() */
 };
 
 static AInputQueue *queue_new(void) {
     AInputQueue *q = calloc(1, sizeof *q);
     if (!q) return NULL;
     pthread_mutex_init(&q->mu, NULL);
+    q->ident = 1;               /* overwritten by the id attachLooper() gets */
     return q;
 }
 
@@ -192,8 +194,10 @@ static int queue_pending(AInputQueue *q) {
 }
 
 void AInputQueue_attachLooper(AInputQueue *queue, void *looper, int ident, void *callback, void *data) {
-    (void)looper; (void)ident; (void)callback; (void)data;
-    if (queue) queue->attached = 1;
+    (void)looper; (void)callback; (void)data;
+    if (!queue) return;
+    queue->ident = ident;
+    queue->attached = 1;
 }
 
 void AInputQueue_detachLooper(AInputQueue *queue) {
@@ -326,7 +330,7 @@ int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outDa
     if (outData) *outData = NULL;
     if (queue_pending(g_queue)) {
         if (outEvents) *outEvents = ALOOPER_EVENT_INPUT;
-        return LOOPER_ID_INPUT;
+        return g_queue->ident;      /* must match the shell's LOOPER_ID_INPUT */
     }
     struct pollfd pfd[MAX_FDS];
     ALooper_callbackFunc cb[MAX_FDS];

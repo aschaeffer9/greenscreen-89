@@ -26,8 +26,9 @@ enum {
     ALOOPER_EVENT_INVALID = 1 << 4,
 };
 
-/* the id the shell uses for input events (the NDK sample defines this itself) */
-#define LOOPER_ID_INPUT 2
+/* main.c defines LOOPER_ID_INPUT itself (the NDK does not), so the shim uses
+ * whatever id the shell passes to AInputQueue_attachLooper() instead of
+ * hard-coding one here. */
 
 ALooper *ALooper_prepare(int opts);
 int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outData);

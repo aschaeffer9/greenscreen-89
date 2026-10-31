@@ -29,6 +29,37 @@ static void px_release(void *info, const void *data, size_t size) {
 
 static __weak GameViewController *g_vc;
 
+/* UIView.contentScaleFactor is 1.0 until the view is attached to a screen, and
+ * the first layout pass happens before that — so ask the screen instead. */
+static CGFloat screen_scale(UIView *v) {
+    UIScreen *sc = v.window.screen;
+    if (!sc) sc = [UIScreen mainScreen];
+    CGFloat s = sc.scale;
+    return s > 0 ? s : 1.0;
+}
+
+/* The canvas must be device pixels. UIScreen.nativeBounds is always in pixels,
+ * so use it whenever the view's own scale looks like points (1.0). */
+static void canvas_pixels(UIView *v, int *outW, int *outH) {
+    UIScreen *sc = v.window.screen ?: [UIScreen mainScreen];
+    CGSize b = v.bounds.size;
+    CGFloat s = screen_scale(v);
+    CGSize native = sc.nativeBounds.size;
+    if (b.width > b.height && native.width < native.height) {
+        CGFloat t = native.width;
+        native.width = native.height;
+        native.height = t;
+    }
+    int w = (int)lrint(b.width * s);
+    int h = (int)lrint(b.height * s);
+    if ((CGFloat)w < native.width * 0.5 || (CGFloat)h < native.height * 0.5) {
+        w = (int)lrint(native.width);
+        h = (int)lrint(native.height);
+    }
+    *outW = w;
+    *outH = h;
+}
+
 void ios_present(const void *px, int w, int h, void *buf) {
     if (!px || w <= 0 || h <= 0) { ios_buffer_done(buf); return; }
     size_t len = (size_t)w * (size_t)h * 4;
@@ -45,7 +76,7 @@ void ios_present(const void *px, int w, int h, void *buf) {
         GameViewController *vc = g_vc;
         if (!vc) { CGImageRelease(img); return; }
         CALayer *layer = vc.view.layer;
-        layer.contentsScale = vc.view.contentScaleFactor;
+        layer.contentsScale = screen_scale(vc.view);
         layer.contentsGravity = kCAGravityResize;
         layer.contents = (__bridge id)img;
         CGImageRelease(img);
@@ -133,25 +164,33 @@ void ios_log(const char *fmt, ...) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     g_vc = self;
+    self.view.contentScaleFactor = screen_scale(self.view);
     _touchIds = [NSMutableDictionary dictionary];
     _nextTouchId = 1;
     ios_android_create();
 }
 
+/* the shell works in pixels: points x screen scale */
+- (void)applyPixelSize {
+    CGFloat s = screen_scale(self.view);
+    if (self.view.contentScaleFactor != s) self.view.contentScaleFactor = s;
+    CGSize b = self.view.bounds.size;
+    int w = 0, h = 0;
+    canvas_pixels(self.view, &w, &h);
+    ios_log("view %.0fx%.0f pt, scale %.2f -> %dx%d px, window %s",
+            b.width, b.height, s, w, h, self.view.window ? "attached" : "nil");
+    ios_android_size(w, h);
+}
+
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat s = self.view.contentScaleFactor;
-    int w = (int)lrint(self.view.bounds.size.width * s);
-    int h = (int)lrint(self.view.bounds.size.height * s);
-    ios_log("view %.0fx%.0f pt, scale %.2f -> %dx%d px, window %s",
-            self.view.bounds.size.width, self.view.bounds.size.height, s, w, h,
-            self.view.window ? "attached" : "nil");
-    ios_android_size(w, h);
+    [self applyPixelSize];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     [self becomeFirstResponder];
+    [self applyPixelSize];       /* the window exists now: correct any 1x first pass */
     ios_android_resume();
 }
 
