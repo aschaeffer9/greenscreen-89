@@ -58,10 +58,13 @@ If that gets annoying, two ways out:
 
 - **[SideStore](https://sidestore.io/) or [AltStore](https://altstore.io/)**
   renew the app on the phone itself, mostly automatically.
-- **A paid Apple Developer account** ($99/year) signs for a year at a time.
+
 
 - https://raw.githubusercontent.com/aschaeffer9/greenscreen-89/main/altstore-source.json
-Or install through AltStore: Sources → + → paste the source URL above.
+
+ install through AltStore: Sources → + → paste the source URL above.
+
+ - **A paid Apple Developer account** ($99/year) signs for a year at a time.
 
 ## If something goes wrong
 
