@@ -60,6 +60,9 @@ If that gets annoying, two ways out:
   renew the app on the phone itself, mostly automatically.
 - **A paid Apple Developer account** ($99/year) signs for a year at a time.
 
+- https://raw.githubusercontent.com/aschaeffer9/greenscreen-89/main/altstore-source.json
+Or install through AltStore: Sources → + → paste the source URL above.
+
 ## If something goes wrong
 
 | What you see | What to do |
