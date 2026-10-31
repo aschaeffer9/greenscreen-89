@@ -1,0 +1,34 @@
+{
+  "name": "Greenscreen '89",
+  "subtitle": "Game Boy Tetris, from your own cartridge",
+  "description": "A touchscreen port of the 1989 Game Boy Tetris for iPhone and iPad.\n\nNo game is included: on first launch the app asks for your own Tetris (World) (Rev A) ROM image and verifies it before running.\n\nSolo play only on iOS for now. The Android build also has link-cable, Wi-Fi and online play.",
+  "iconURL": "https://raw.githubusercontent.com/aschaeffer9/greenscreen-89/main/android/icon.png",
+  "website": "https://github.com/aschaeffer9/greenscreen-89",
+  "tintColor": "#C6CFA3",
+  "featuredApps": ["com.example.greenscreen89"],
+  "apps": [
+    {
+      "name": "Greenscreen '89",
+      "bundleIdentifier": "com.example.greenscreen89",
+      "developerName": "aschaeffer9",
+      "subtitle": "Tetris (World) (Rev A) on a touchscreen",
+      "localizedDescription": "A port of the 1989 Game Boy Tetris with swipe and flick controls, sound, save states and the original menus.\n\nNo game data is included. Load your own Tetris (World) (Rev A) ROM on first launch (MD5 982ed5d2b12a0377eb14bcdc4123744e).\n\nSolo play only in this build.",
+      "iconURL": "https://raw.githubusercontent.com/aschaeffer9/greenscreen-89/main/android/icon.png",
+      "tintColor": "#C6CFA3",
+      "category": "games",
+      "screenshots": [],
+      "versions": [
+        {
+          "version": "3.4",
+          "date": "2026-10-31",
+          "downloadURL": "https://github.com/aschaeffer9/greenscreen-89/releases/download/v3.4-ios/Greenscreen89-unsigned.ipa",
+          "size": 129146,
+          "minOSVersion": "15.0",
+          "localizedDescription": "First iOS build: full-resolution rendering at 59-60 fps, sound, save states, ROM import."
+        }
+      ],
+      "appPermissions": { "entitlements": [], "privacy": {} }
+    }
+  ],
+  "news": []
+}
