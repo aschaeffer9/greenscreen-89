@@ -1,4 +1,5 @@
 # Greenscreen '89
+<img width="192" height="192" alt="greenscreen-icon" src="https://github.com/user-attachments/assets/96bd3dcf-3f35-48fa-ba06-da3533a752a9" />
 
 A touchscreen Android app for playing the 1989 Game Boy Tetris from **your own cartridge**. It has swipe and flick controls, link-cable multiplayer (same Wi-Fi, USB-C phone to phone, or online) and a built-in CPU opponent.
 
