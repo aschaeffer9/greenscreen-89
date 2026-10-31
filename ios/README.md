@@ -23,7 +23,15 @@ and a zip. On GitHub, `.github/workflows/ios.yml` does the same on a
 `macos-26` runner and uploads the `.ipa` as an artifact.
 
 Options: `PACKAGE=com.you.greenscreen89`, `VERSION_NAME=3.5`,
-`VERSION_CODE=18`, `MIN_IOS=15.0`.
+`VERSION_CODE=18`, `MIN_IOS=15.0`, `SDK=iphonesimulator` (builds the Simulator
+slice instead of the device IPA).
+
+The `simulator` job in the workflow builds that slice, boots an iPhone
+Simulator on the runner, installs and launches the app, then uploads a
+screenshot and the app's log as the `simulator-shot` artifact. A green run does
+not mean the app worked — open `launch.png`; if the app crashed, `app.log` says
+where. Touch input is not injected, and there is no ROM, so the useful outcome
+is "the ROM screen renders" or a crash report.
 
 ## Install
 
