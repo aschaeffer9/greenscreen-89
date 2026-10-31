@@ -1,0 +1,51 @@
+name: ios
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - 'android/**'
+      - 'core/**'
+      - 'gen.py'
+      - '.github/workflows/ios.yml'
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build unsigned IPA
+        env:
+          VERSION_NAME: '3.4'
+          VERSION_CODE: '17'
+        run: |
+          chmod +x ios/build_ios.sh
+          ./ios/build_ios.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Greenscreen89-unsigned-ipa
+          path: build/Greenscreen89-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/Greenscreen89-unsigned.ipa \
+            --title "Greenscreen '89 $GITHUB_REF_NAME" --generate-notes \
+          || gh release upload "$GITHUB_REF_NAME" build/Greenscreen89-unsigned.ipa --clobber
