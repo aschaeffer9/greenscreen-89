@@ -87,6 +87,7 @@ jobs:
             printf '%s' "$T89_ROM_B64" | base64 --decode > "$CONTAINER/Documents/rom.gb" 2>/dev/null \
               || printf '%s' "$T89_ROM_B64" | base64 -D > "$CONTAINER/Documents/rom.gb"
             echo "ROM placed in the app container ($(wc -c < "$CONTAINER/Documents/rom.gb") bytes)"
+                        echo "md5 in container: $(md5 -q "$CONTAINER/Documents/rom.gb")"
           else
             echo "no T89_ROM_B64 secret set: the app will show the ROM screen"
           fi
