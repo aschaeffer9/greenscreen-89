@@ -143,6 +143,9 @@ void ios_log(const char *fmt, ...) {
     CGFloat s = self.view.contentScaleFactor;
     int w = (int)lrint(self.view.bounds.size.width * s);
     int h = (int)lrint(self.view.bounds.size.height * s);
+    ios_log("view %.0fx%.0f pt, scale %.2f -> %dx%d px, window %s",
+            self.view.bounds.size.width, self.view.bounds.size.height, s, w, h,
+            self.view.window ? "attached" : "nil");
     ios_android_size(w, h);
 }
 

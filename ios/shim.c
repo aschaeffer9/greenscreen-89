@@ -120,6 +120,10 @@ int32_t ANativeWindow_lock(ANativeWindow *window, ANativeWindow_Buffer *out, ARe
 
 int32_t ANativeWindow_unlockAndPost(ANativeWindow *window) {
     if (!window) return -1;
+    {   /* one line of geometry so the layout can be checked from CI logs */
+        static int logged;
+        if (!logged) { logged = 1; ios_log("first frame %dx%d stride %d", window->w, window->h, window->w); }
+    }
     pthread_mutex_lock(&window->mu);
     if (!window->locked) { pthread_mutex_unlock(&window->mu); return -1; }
     window->locked = 0;
@@ -626,6 +630,7 @@ void ios_android_create(void) {
 
 void ios_android_size(int w, int h) {
     if (!g_started || g_destroyed || w <= 0 || h <= 0) return;
+    ios_log("window request %dx%d dpi %.0f", w, h, ios_dpi());
     if (g_win && g_win->w == w && g_win->h == h) return;
     int old_w = g_win ? g_win->w : 0, old_h = g_win ? g_win->h : 0;
     if (g_win) {
