@@ -35,12 +35,15 @@ jobs:
           chmod +x ios/build_ios.sh
           ./ios/build_ios.sh
 
+      # artifacts expire (90 days by default) and need a login to download,
+      # so this is for your own testing only
       - uses: actions/upload-artifact@v4
         with:
           name: Greenscreen89-unsigned-ipa
           path: build/Greenscreen89-unsigned.ipa
           if-no-files-found: error
 
+      # tags get a permanent public download for Sideloadly / AltStore
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -49,3 +52,49 @@ jobs:
           gh release create "$GITHUB_REF_NAME" build/Greenscreen89-unsigned.ipa \
             --title "Greenscreen '89 $GITHUB_REF_NAME" --generate-notes \
           || gh release upload "$GITHUB_REF_NAME" build/Greenscreen89-unsigned.ipa --clobber
+
+  # Runs the app on the runner's iPhone Simulator and screenshots it: the only
+  # way to see whether the platform layer actually works without a device.
+  simulator:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for the simulator
+        env:
+          SDK: iphonesimulator
+          VERSION_NAME: '3.4'
+        run: |
+          chmod +x ios/build_ios.sh
+          ./ios/build_ios.sh
+
+      - name: Boot, install, launch, screenshot
+        run: |
+          set -euo pipefail
+          APP="build/ios-sim/Payload/Greenscreen89.app"
+          UDID="$(xcrun simctl list devices available | grep -m1 iPhone | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')"
+          echo "simulator: $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" com.example.greenscreen89 || true
+          sleep 12
+          mkdir -p build/shots
+          xcrun simctl io "$UDID" screenshot build/shots/launch.png
+          xcrun simctl spawn "$UDID" log show --last 2m --style compact \
+            --predicate 'process == "Greenscreen89"' > build/shots/app.log || true
+          echo "--- last lines ---"
+          tail -40 build/shots/app.log || true
+          if xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -qi greenscreen; then
+            echo "APP RUNNING"
+          else
+            echo "APP NOT RUNNING (crashed or exited early — check app.log and launch.png)"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulator-shot
+          path: build/shots/
+          if-no-files-found: warn
